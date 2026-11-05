@@ -1,0 +1,109 @@
+[package]
+name = "ai-security-platform-app"
+version = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+publish = { workspace = true }
+
+[[bin]]
+name = "ai-security-platform"
+path = "src/main.rs"
+bench = false
+
+[[bin]]
+name = "ai-security-platform-llm"
+path = "src/bin/ai-llm-gateway.rs"
+bench = false
+required-features = ["gateway-llm"]
+
+[[bin]]
+name = "ai-security-platform-mcp"
+path = "src/bin/ai-mcp-gateway.rs"
+bench = false
+required-features = ["gateway-mcp"]
+
+[[bin]]
+name = "ai-security-platform-routing"
+path = "src/bin/ai-llm-routing-gateway.rs"
+bench = false
+required-features = ["gateway-llm", "inference-routing"]
+
+[[bin]]
+name = "ai-security-platform-agent"
+path = "src/bin/ai-agent-gateway.rs"
+bench = false
+required-features = ["gateway-llm", "gateway-a2a"]
+
+[[bin]]
+name = "ai-security-platform-full"
+path = "src/bin/ai-full-gateway.rs"
+bench = false
+required-features = ["gateway-llm", "gateway-a2a", "gateway-mcp"]
+
+[features]
+# Jemalloc has been found to have the highest throughput and best ability to return memory to the system
+# This comes at the small cost of a few mb memory overhead relative to others (most notable in an empty setup).
+default = [
+	"gateway-full",
+	"runtime-base",
+	"security-a2a-sqlite",
+	"jemalloc",
+	"mimalloc",
+	"tls-aws-lc",
+]
+# LLM-only edge composition. Choose one TLS feature explicitly with --no-default-features.
+llm-edge = ["gateway-llm", "security-s1", "database", "telemetry-otlp"]
+mcp-edge = ["gateway-mcp", "security-s1", "database", "telemetry-otlp"]
+runtime-base = ["ai-security-platform-runtime/runtime-base"]
+gateway-llm = ["ai-security-platform-runtime/gateway-llm"]
+gateway-a2a = ["ai-security-platform-runtime/gateway-a2a"]
+gateway-mcp = ["ai-security-platform-runtime/gateway-mcp"]
+inference-routing = ["ai-security-platform-runtime/inference-routing", "gateway-llm"]
+security-s1 = ["ai-security-platform-runtime/security-s1"]
+security-a2a-sqlite = ["ai-security-platform-runtime/security-a2a-sqlite"]
+gateway-rag = ["ai-security-platform-runtime/gateway-rag"]
+security-pii = ["ai-security-platform-runtime/security-pii"]
+security-pii-presidio = ["ai-security-platform-runtime/security-pii-presidio"]
+gateway-full = [
+	"gateway-llm",
+	"gateway-a2a",
+	"gateway-mcp",
+	"inference-routing",
+	"security-s1",
+	"gateway-rag",
+]
+jemalloc = ["dep:tikv-jemallocator", "ai-security-platform-runtime/jemalloc"]
+mimalloc = ["dep:mimalloc", "ai-security-platform-runtime/mimalloc"]
+# TLS crypto provider passthroughs. A provider must be selected; `tls-aws-lc` is the default.
+# Builds that pass `--no-default-features` (e.g. arm64 musl, which drops jemalloc) MUST re-add one
+# of these, otherwise the AI Gateway Runtime TLS code will fail to compile.
+tls-aws-lc = ["ai-security-platform-runtime/tls-aws-lc"]
+tls-openssl = ["ai-security-platform-runtime/tls-openssl"]
+providers-aws = ["ai-security-platform-runtime/providers-aws"]
+providers-azure = ["ai-security-platform-runtime/providers-azure"]
+providers-gcp = ["ai-security-platform-runtime/providers-gcp"]
+database = ["ai-security-platform-runtime/database"]
+telemetry-otlp = ["ai-security-platform-runtime/telemetry-otlp"]
+schema = ["ai-security-platform-runtime/schema"]
+
+[dependencies]
+pprof-alloc.workspace = true
+platform-core.workspace = true
+ai-security-platform-runtime = { path = "../runtime", default-features = false }
+anyhow.workspace = true
+clap.workspace = true
+fs-err = { workspace = true, features = ["tokio"] }
+libc.workspace = true
+mimalloc = { workspace = true, optional = true }
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
+[lints.clippy]
+# This rule makes code more confusing
+assigning_clones = "allow"
+# This doesn't understand `strng` which we use everywhere
+borrow_interior_mutable_const = "allow"
+declare_interior_mutable_const = "allow"

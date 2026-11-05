@@ -1,0 +1,264 @@
+[package]
+name = "ai-security-platform-runtime"
+version = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+publish = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = [
+	"gateway-full",
+	"runtime-base",
+	"security-a2a-sqlite",
+	"jemalloc",
+	"mimalloc",
+	"tls-aws-lc",
+]
+# LLM-only edge composition. Choose one TLS feature explicitly with --no-default-features.
+llm-edge = ["gateway-llm", "security-s1", "database", "telemetry-otlp"]
+mcp-edge = ["gateway-mcp", "security-s1", "database", "telemetry-otlp"]
+runtime-base = [
+	"providers-aws",
+	"providers-azure",
+	"providers-gcp",
+	"database",
+	"telemetry-otlp",
+]
+gateway-llm = ["gateway-composition/gateway-llm", "dep:tiktoken-rs", "gateway-llm/protocol", "dep:async-openai"]
+gateway-a2a = ["gateway-composition/gateway-a2a", "dep:gateway-a2a"]
+gateway-mcp = ["gateway-composition/gateway-mcp", "dep:gateway-mcp", "dep:rmcp"]
+inference-routing = ["gateway-composition/inference-routing", "gateway-llm"]
+security-s1 = ["gateway-composition/security-s1"]
+gateway-rag = ["gateway-composition/gateway-rag", "dep:gateway-rag", "dep:security-rag"]
+security-pii = ["dep:security-pii", "security-integration-runtime/pii"]
+security-pii-presidio = ["security-pii", "security-pii/presidio"]
+gateway-full = [
+	"gateway-llm",
+	"gateway-a2a",
+	"gateway-mcp",
+	"inference-routing",
+	"security-s1",
+	"gateway-rag",
+]
+jemalloc = ["dep:tikv-jemallocator", "dep:jemalloc_pprof"]
+mimalloc = ["pprof-alloc/allocator-mimalloc", "dep:mimalloc"]
+tls-aws-lc = ["rustls/aws_lc_rs", "tokio-rustls/aws_lc_rs"]
+tls-openssl = ["dep:openssl", "dep:rustls-openssl"]
+# Cloud provider SDKs. Disable when not needed to reduce compile time and binary size.
+providers-aws = [
+    "dep:aws-config",
+    "dep:aws-credential-types",
+    "dep:aws-sigv4",
+    "dep:aws-types",
+    "dep:aws-smithy-eventstream",
+    "dep:aws-smithy-types",
+]
+providers-azure = ["dep:azure_core", "dep:azure_identity", "dep:typespec_client_core"]
+providers-gcp = ["dep:google-cloud-auth"]
+# Request log persistence (SQLite/PostgreSQL).
+database = ["dep:sqlx"]
+# Durable A2A ownership metadata, independent of request log persistence.
+security-a2a-sqlite = ["security-integration-runtime/a2a-sqlite"]
+# OpenTelemetry trace/log export.
+telemetry-otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry-http",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-proto",
+    "dep:opentelemetry_sdk",
+]
+schema = ["schemars", "gateway-llm/schema"]
+assert_size_runtime = ["platform-core/assert_size_runtime"]
+
+[dependencies]
+security-pii = { path = "../../security/pii", optional = true }
+gateway-contracts = { path = "../contracts" }
+gateway-llm = { path = "../llm", default-features = false }
+gateway-protocol-core = { path = "../protocol-core" }
+gateway-mcp = { path = "../mcp", optional = true, features = ["openapi"] }
+gateway-a2a = { path = "../a2a", optional = true }
+platform-core.workspace = true
+platform-celx.workspace = true
+platform-hbone.workspace = true
+platform-pool.workspace = true
+gateway-composition = { path = "../composition", default-features = false }
+gateway-rag = { path = "../rag", optional = true }
+security-pipeline = { path = "../../security/pipeline" }
+security-audit = { path = "../../security/audit" }
+security-rag = { path = "../../security/rag", optional = true }
+security-integration-runtime = { path = "../../security/integration-runtime" }
+security-capability-broker = { path = "../../security/capability-broker" }
+security-types = { path = "../../security/types" }
+anyhow.workspace = true
+arc-swap.workspace = true
+async-compression.workspace = true
+async-openai = { workspace = true, optional = true, features = ["chat-completion-types", "moderation-types", "response-types", "realtime-types"] }
+async-trait.workspace = true
+atomic_float.workspace = true
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-sigv4 = { workspace = true, optional = true }
+aws-types = { workspace = true, optional = true }
+aws-lc-rs.workspace = true
+openssl = { workspace = true, optional = true }
+rustls-openssl = { workspace = true, optional = true }
+aws-smithy-eventstream = { workspace = true, optional = true }
+aws-smithy-types = { workspace = true, optional = true }
+axum-core.workspace = true
+axum-extra.workspace = true
+axum.workspace = true
+azure_core = { workspace = true, optional = true }
+azure_identity = { workspace = true, optional = true }
+base64.workspace = true
+bytes.workspace = true
+cookie.workspace = true
+cel.workspace = true
+chrono.workspace = true
+clocksource.workspace = true
+core_affinity.workspace = true
+crossbeam.workspace = true
+frozen-collections.workspace = true
+fs-err = { workspace = true }
+futures-core.workspace = true
+futures-util.workspace = true
+futures.workspace = true
+google-cloud-auth = { workspace = true, optional = true }
+hashbrown.workspace = true
+headers.workspace = true
+heck.workspace = true
+hex.workspace = true
+hickory-resolver.workspace = true
+htpasswd-verify-fork.workspace = true
+http-body-util.workspace = true
+http-body.workspace = true
+http-serde.workspace = true
+http.workspace = true
+httpdate.workspace = true
+hyper-util.workspace = true
+hyper.workspace = true
+indexmap = { workspace = true }
+ipnet.workspace = true
+itertools.workspace = true
+jsonwebtoken.workspace = true
+lazy_static.workspace = true
+macro_rules_attribute.workspace = true
+notify-debouncer-full.workspace = true
+notify.workspace = true
+num_cpus.workspace = true
+once_cell.workspace = true
+multer.workspace = true
+openapiv3.workspace = true
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry-proto = { workspace = true, optional = true }
+opentelemetry-http = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+parking_lot.workspace = true
+pem.workspace = true
+percent-encoding.workspace = true
+phonenumber.workspace = true
+pin-project-lite.workspace = true
+ppp.workspace = true
+prometheus-client.workspace = true
+platform-protos.workspace = true
+prost-types.workspace = true
+prost-wkt-types.workspace = true
+prost.workspace = true
+rand.workspace = true
+quick_cache.workspace = true
+libc.workspace = true
+rcgen.workspace = true
+regex.workspace = true
+
+rmcp = { version = "2.0", optional = true, features = [
+    "client",
+    "server",
+    "base64",
+    "server-side-http",
+    "transport-child-process",
+] }
+rust_decimal.workspace = true
+rustls-native-certs.workspace = true
+rustls-pki-types.workspace = true
+rustls.workspace = true
+schemars = { workspace = true, optional = true }
+secrecy.workspace = true
+serde-transcode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_json_path_to_error.workspace = true
+serde_regex.workspace = true
+serde_urlencoded.workspace = true
+serde_with.workspace = true
+serde_yaml.workspace = true
+serde-untagged.workspace = true
+sha2.workspace = true
+stacker.workspace = true
+shellexpand.workspace = true
+socket2.workspace = true
+sse-stream.workspace = true
+subtle.workspace = true
+sqlx = { workspace = true, optional = true }
+thiserror.workspace = true
+tiktoken-rs = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tokio_sse_codec.workspace = true
+tonic.workspace = true
+tower-http.workspace = true
+tower-serve-static.workspace = true
+tower.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+typespec_client_core = { workspace = true, optional = true }
+url.workspace = true
+uuid.workspace = true
+x509-parser.workspace = true
+reqwest.workspace = true
+websocket-sans-io.workspace = true
+vector-map.workspace = true
+flagset.workspace = true
+
+# Linux only dependencies
+[target.'cfg(target_family = "unix")'.dependencies]
+pprof.workspace = true
+
+# Windows only dependencies
+[target.'cfg(target_family = "windows")'.dependencies]
+which.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true, features = ["taskdump"] }
+tikv-jemallocator = { workspace = true, optional = true }
+jemalloc_pprof = { workspace = true, optional = true }
+
+[target.'cfg(all(target_os = "linux", not(all(target_env = "musl", target_arch = "aarch64"))))'.dependencies]
+pprof-alloc = { workspace = true, features = ["allocator-jemalloc"] }
+
+[target.'cfg(all(target_os = "linux", target_env = "musl", target_arch = "aarch64"))'.dependencies]
+pprof-alloc.workspace = true
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+pprof-alloc.workspace = true
+tokio = { workspace = true }
+
+[lints.clippy]
+# This rule makes code more confusing
+assigning_clones = "allow"
+# This doesn't understand `strng` which we use everywhere
+borrow_interior_mutable_const = "allow"
+declare_interior_mutable_const = "allow"
+
+[lints.rust]
+# This rule makes code more confusing
+mismatched_lifetime_syntaxes = "allow"
+# ossl350 is set by the openssl-sys crate when OpenSSL >= 3.5.0 is detected.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(ossl350)'] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

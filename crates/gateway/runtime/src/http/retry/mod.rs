@@ -1,0 +1,68 @@
+mod body;
+
+use std::num::NonZeroU8;
+use std::sync::Arc;
+use std::time::Duration;
+
+pub use body::ReplayBody;
+
+use crate::cel::Expression;
+use crate::store::HasExpressions;
+use crate::*;
+
+#[apply(schema!)]
+#[cfg_attr(feature = "schema", schemars(rename = "RetryPolicy"))]
+pub struct Policy {
+	/// Maximum retries after the original request (1 means at most 2 outbound attempts).
+	#[serde(default = "default_attempts")]
+	pub attempts: NonZeroU8,
+	/// Delay between retry attempts.
+	#[serde(
+		default,
+		skip_serializing_if = "Option::is_none",
+		with = "serde_dur_option"
+	)]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+	pub backoff: Option<Duration>,
+	/// HTTP response status codes that should be retried.
+	#[serde(serialize_with = "ser_display_iter", deserialize_with = "de_codes")]
+	#[cfg_attr(feature = "schema", schemars(with = "Vec<std::num::NonZeroU16>"))]
+	pub codes: Box<[http::StatusCode]>,
+	/// CEL expression evaluated against the request before any attempt; when `false`,
+	/// retries are disabled (only the initial attempt is made), e.g. `request.method == "GET"`.
+	/// Retrying requires buffering the request body in memory for replay, so this lets us skip
+	/// that cost when the request is known to be non-retriable (e.g. streaming or websockets).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub precondition: Option<Arc<Expression>>,
+	/// CEL expression evaluated against each response to decide whether to retry. A response
+	/// is retried when its status code is in `codes` *or* this expression evaluates to `true`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub condition: Option<Arc<Expression>>,
+}
+
+impl HasExpressions for Policy {
+	/// Exposes the precondition/condition expressions so the proxy snapshots the
+	/// request/response attributes they reference.
+	fn expressions(&self) -> impl Iterator<Item = &Expression> {
+		self
+			.precondition
+			.iter()
+			.chain(self.condition.iter())
+			.map(|e| e.as_ref())
+	}
+}
+
+pub fn de_codes<'de: 'a, 'a, D>(deserializer: D) -> Result<Box<[http::StatusCode]>, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let raw = Vec::<u16>::deserialize(deserializer)?;
+	let boxed = raw
+		.into_iter()
+		.map(|c| http::StatusCode::from_u16(c).map_err(serde::de::Error::custom))
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(boxed.into_boxed_slice())
+}
+fn default_attempts() -> NonZeroU8 {
+	NonZeroU8::new(1).unwrap()
+}

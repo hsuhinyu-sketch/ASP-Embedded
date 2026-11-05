@@ -1,0 +1,499 @@
+//! RAG retrieval security brick.
+//!
+//! `SecureRetriever` makes a vector-store adapter follow one safe sequence: authorize the corpus
+//! search, push a trusted tenant/principal filter to the backend, and independently re-check every
+//! returned chunk before it is allowed into model context. The second check is intentional: a
+//! vector index is not an authorization boundary and may be stale, misconfigured, or return a
+//! broader candidate set than requested.
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
+use chrono::{DateTime, Utc};
+use security_audit::AuditSink;
+use security_pipeline::{
+	Authorizer, GatewayError, GatewayIdentity, SecurityPipeline, knowledge_retrieve_for_identity,
+};
+pub use security_types::DataClassification;
+use security_types::Subject;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub mod context;
+pub mod ingestion;
+pub mod lifecycle;
+pub mod sources;
+
+pub use context::{
+	ContextAssemblyError, ContextAuditEvent, ContextAuditOutcome, ContextAuditSink, ContextFinding,
+	ContextFindingKind, ContextGuard, ContextGuardConfig, ContextGuardMode, GuardedContext,
+	InMemoryContextAuditSink,
+};
+pub use ingestion::{
+	ContentClassificationRule, ContentLabelRule, DocumentIngestBackend, DocumentIngestRequest,
+	InMemoryIngestionAuditSink, IndexedDocument, IngestionAuditEvent, IngestionAuditOutcome,
+	IngestionAuditSink, IngestionError, IngestionFinding, IngestionFindingKind, IngestionGuardConfig,
+	IngestionResult, QuarantinedDocument, SecureIngestor, SourceOrigin, TrustedChunkAccess,
+};
+pub use sources::{TrustedHttpsSourceConfig, TrustedHttpsSourceRegistry};
+
+/// System-level controls for one RAG corpus integration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RagSecurityConfig {
+	/// Maximum authorized chunks that can enter one model context.
+	pub max_chunks: usize,
+	/// Maximum trusted token count that can enter one model context.
+	pub max_context_tokens: u64,
+	/// Chunks carrying any blocked label are never placed in model context.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub blocked_labels: Vec<String>,
+}
+
+impl Default for RagSecurityConfig {
+	fn default() -> Self {
+		Self {
+			max_chunks: 8,
+			max_context_tokens: 6_000,
+			blocked_labels: Vec::new(),
+		}
+	}
+}
+
+/// A query is retained only for the retrieval backend. Audit and authorization receive its SHA-256
+/// digest rather than its contents, so prompts do not leak into security telemetry by default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalQuery {
+	text: String,
+	query_hash: String,
+	limit: usize,
+}
+
+impl RetrievalQuery {
+	pub fn new(text: impl Into<String>, limit: usize) -> Self {
+		let text = text.into();
+		let query_hash = hex::encode(Sha256::digest(text.as_bytes()));
+		Self {
+			text,
+			query_hash,
+			limit,
+		}
+	}
+
+	pub fn text(&self) -> &str {
+		&self.text
+	}
+
+	pub fn query_hash(&self) -> &str {
+		&self.query_hash
+	}
+
+	pub fn limit(&self) -> usize {
+		self.limit
+	}
+}
+
+/// Trusted filter supplied to a vector-store adapter. It is derived from verified gateway identity,
+/// not from untrusted query fields. Backends should enforce it during candidate selection; the
+/// guard still performs a mandatory post-retrieval check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalFilter {
+	/// Only the lifecycle wrapper sets this; an authoritative post-filter remains mandatory.
+	pub authoritative_acl: bool,
+	pub corpus_id: String,
+	pub tenant_id: String,
+	pub user_id: Option<String>,
+	pub agent_id: Option<String>,
+	pub max_candidates: usize,
+}
+
+/// A Chunk returned by a retrieval backend. `content` remains in-process for context assembly and
+/// is deliberately absent from [`RetrievalAuditEvent`]; telemetry records only IDs and hashes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeChunk {
+	pub id: String,
+	pub document_id: String,
+	pub corpus_id: String,
+	pub tenant_id: String,
+	pub content: String,
+	/// Labels inherited from the source document, such as `pii` or `confidential`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub labels: Vec<String>,
+	/// Assigned at ingestion; missing legacy values are conservatively restricted.
+	#[serde(default)]
+	pub classification: DataClassification,
+	#[serde(default = "default_legacy_classification_source")]
+	pub classification_source: String,
+	/// Explicit user ACL. An empty list grants no user access by itself.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub allowed_users: Vec<String>,
+	/// Explicit Agent ACL. An empty list grants no Agent access by itself.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub allowed_agents: Vec<String>,
+	/// Explicitly permits any authenticated User or Agent in the owning tenant.
+	#[serde(default)]
+	pub allow_tenant_authenticated: bool,
+	/// Expired chunks are excluded even if their index entry still exists.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub expires_at: Option<DateTime<Utc>>,
+	/// Content hash recorded at ingestion. A missing hash means provenance is incomplete and fails
+	/// closed, preventing untracked index content from reaching the model.
+	pub source_hash: String,
+	#[serde(default)]
+	pub source_origin: SourceOrigin,
+	/// Token count calculated during ingestion or trusted tokenization.
+	pub token_count: u64,
+}
+
+fn default_legacy_classification_source() -> String {
+	"legacy-unverified".into()
+}
+
+/// Retrieval adapter contract. Implementations receive the trusted filter before similarity search.
+#[async_trait::async_trait]
+pub trait RetrievalBackend: Send + Sync {
+	async fn retrieve(
+		&self,
+		query: &RetrievalQuery,
+		filter: &RetrievalFilter,
+	) -> Result<Vec<KnowledgeChunk>, String>;
+}
+
+#[async_trait::async_trait]
+impl<T: RetrievalBackend + ?Sized> RetrievalBackend for Arc<T> {
+	async fn retrieve(
+		&self,
+		query: &RetrievalQuery,
+		filter: &RetrievalFilter,
+	) -> Result<Vec<KnowledgeChunk>, String> {
+		(**self).retrieve(query, filter).await
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalRejection {
+	pub chunk_id: String,
+	pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedContext {
+	pub corpus_id: String,
+	pub query_hash: String,
+	pub chunks: Vec<KnowledgeChunk>,
+	pub context_tokens: u64,
+	pub rejected: Vec<RetrievalRejection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetrievalAuditOutcome {
+	Authorized,
+	Denied,
+}
+
+/// Retrieval-specific audit data. It records IDs and hashes, never Chunk or prompt text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalAuditEvent {
+	pub request_id: String,
+	pub subject: Subject,
+	pub corpus_id: String,
+	pub query_hash: String,
+	pub outcome: RetrievalAuditOutcome,
+	pub accepted_chunk_ids: Vec<String>,
+	pub classification: Option<DataClassification>,
+	pub rejected: Vec<RetrievalRejection>,
+	pub reason: Option<String>,
+	pub timestamp: DateTime<Utc>,
+}
+
+pub trait RetrievalAuditSink: Send + Sync {
+	fn record(&self, event: RetrievalAuditEvent);
+}
+
+impl<T: RetrievalAuditSink + ?Sized> RetrievalAuditSink for &T {
+	fn record(&self, event: RetrievalAuditEvent) {
+		(*self).record(event);
+	}
+}
+
+#[derive(Default)]
+pub struct InMemoryRetrievalAuditSink {
+	events: Mutex<Vec<RetrievalAuditEvent>>,
+}
+
+impl InMemoryRetrievalAuditSink {
+	pub fn events(&self) -> Vec<RetrievalAuditEvent> {
+		self
+			.events
+			.lock()
+			.expect("retrieval audit sink lock poisoned")
+			.clone()
+	}
+}
+
+impl RetrievalAuditSink for InMemoryRetrievalAuditSink {
+	fn record(&self, event: RetrievalAuditEvent) {
+		self
+			.events
+			.lock()
+			.expect("retrieval audit sink lock poisoned")
+			.push(event);
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetrievalError {
+	InvalidConfig(String),
+	MissingTenant,
+	RequestedLimitZero,
+	RequestedLimitExceedsBudget { requested: usize, maximum: usize },
+	GatewayDenied(GatewayError),
+	Backend(String),
+}
+
+/// Enforced retrieval sequence around an arbitrary vector-store adapter.
+pub struct SecureRetriever<R, A, S, RS> {
+	backend: R,
+	pipeline: SecurityPipeline<A, S>,
+	config: RagSecurityConfig,
+	audit: RS,
+}
+
+impl<R, A, S, RS> SecureRetriever<R, A, S, RS>
+where
+	R: RetrievalBackend,
+	A: Authorizer,
+	S: AuditSink,
+	RS: RetrievalAuditSink,
+{
+	pub fn new(
+		backend: R,
+		pipeline: SecurityPipeline<A, S>,
+		config: RagSecurityConfig,
+		audit: RS,
+	) -> Result<Self, RetrievalError> {
+		if config.max_chunks == 0 {
+			return Err(RetrievalError::InvalidConfig(
+				"maxChunks must be greater than zero".into(),
+			));
+		}
+		if config.max_context_tokens == 0 {
+			return Err(RetrievalError::InvalidConfig(
+				"maxContextTokens must be greater than zero".into(),
+			));
+		}
+		Ok(Self {
+			backend,
+			pipeline,
+			config,
+			audit,
+		})
+	}
+
+	pub async fn retrieve(
+		&self,
+		request_id: impl Into<String>,
+		identity: GatewayIdentity,
+		corpus_id: impl Into<String>,
+		query: RetrievalQuery,
+	) -> Result<AuthorizedContext, RetrievalError> {
+		let request_id = request_id.into();
+		let corpus_id = corpus_id.into();
+		let action = knowledge_retrieve_for_identity(request_id, identity, corpus_id.clone());
+
+		if query.limit() == 0 {
+			return self.deny(
+				&action,
+				query.query_hash(),
+				RetrievalError::RequestedLimitZero,
+			);
+		}
+		if query.limit() > self.config.max_chunks {
+			return self.deny(
+				&action,
+				query.query_hash(),
+				RetrievalError::RequestedLimitExceedsBudget {
+					requested: query.limit(),
+					maximum: self.config.max_chunks,
+				},
+			);
+		}
+		let Some(tenant_id) = action.subject.tenant_id.clone() else {
+			return self.deny(&action, query.query_hash(), RetrievalError::MissingTenant);
+		};
+		let arguments = serde_json::json!({
+			"queryHash": query.query_hash(),
+			"requestedLimit": query.limit(),
+		});
+		if let Err(error) = self
+			.pipeline
+			.authorize_async(&action, Some(&arguments))
+			.await
+		{
+			return self.deny(
+				&action,
+				query.query_hash(),
+				RetrievalError::GatewayDenied(error),
+			);
+		}
+
+		let filter = RetrievalFilter {
+			authoritative_acl: false,
+			corpus_id: corpus_id.clone(),
+			tenant_id,
+			user_id: action.subject.user_id.clone(),
+			agent_id: action.subject.agent_id.clone(),
+			max_candidates: query.limit(),
+		};
+		let candidates = self
+			.backend
+			.retrieve(&query, &filter)
+			.await
+			.map_err(RetrievalError::Backend)?;
+		let context = self.filter_candidates(&action, &query, candidates);
+		self.audit.record(RetrievalAuditEvent {
+			request_id: action.request_id,
+			subject: action.subject,
+			corpus_id,
+			query_hash: context.query_hash.clone(),
+			outcome: RetrievalAuditOutcome::Authorized,
+			accepted_chunk_ids: context
+				.chunks
+				.iter()
+				.map(|chunk| chunk.id.clone())
+				.collect(),
+			classification: context
+				.chunks
+				.iter()
+				.map(|chunk| chunk.classification)
+				.max(),
+			rejected: context.rejected.clone(),
+			reason: None,
+			timestamp: Utc::now(),
+		});
+		Ok(context)
+	}
+
+	/// Exposes the common pipeline to the next RAG stage. Callers use this with `ContextGuard` so
+	/// retrieval and context assembly share the same identity, authorization, and audit boundary.
+	pub fn security_pipeline(&self) -> &SecurityPipeline<A, S> {
+		&self.pipeline
+	}
+
+	fn filter_candidates(
+		&self,
+		action: &security_types::ActionRequest,
+		query: &RetrievalQuery,
+		candidates: Vec<KnowledgeChunk>,
+	) -> AuthorizedContext {
+		let mut chunks = Vec::new();
+		let mut rejected = Vec::new();
+		let mut accepted_chunk_ids = HashSet::new();
+		let mut context_tokens = 0;
+		for chunk in candidates {
+			if let Err(reason) = self.chunk_access_reason(action, &chunk, context_tokens) {
+				rejected.push(RetrievalRejection {
+					chunk_id: chunk.id,
+					reason,
+				});
+				continue;
+			}
+			if chunks.len() >= query.limit() {
+				rejected.push(RetrievalRejection {
+					chunk_id: chunk.id,
+					reason: "chunk exceeds the requested retrieval limit".into(),
+				});
+				continue;
+			}
+			if !accepted_chunk_ids.insert(chunk.id.clone()) {
+				rejected.push(RetrievalRejection {
+					chunk_id: chunk.id,
+					reason: "duplicate chunk returned by retrieval backend".into(),
+				});
+				continue;
+			}
+			context_tokens += chunk.token_count;
+			chunks.push(chunk);
+		}
+		AuthorizedContext {
+			corpus_id: action.resource.id.clone(),
+			query_hash: query.query_hash().to_string(),
+			chunks,
+			context_tokens,
+			rejected,
+		}
+	}
+
+	fn chunk_access_reason(
+		&self,
+		action: &security_types::ActionRequest,
+		chunk: &KnowledgeChunk,
+		current_tokens: u64,
+	) -> Result<(), String> {
+		if chunk.corpus_id != action.resource.id {
+			return Err("chunk belongs to a different corpus".into());
+		}
+		if action.subject.tenant_id.as_deref() != Some(chunk.tenant_id.as_str()) {
+			return Err("chunk tenant does not match verified request tenant".into());
+		}
+		if chunk
+			.expires_at
+			.is_some_and(|expires_at| expires_at <= Utc::now())
+		{
+			return Err("chunk has expired".into());
+		}
+		if chunk.source_hash.is_empty() {
+			return Err("chunk has no ingestion provenance hash".into());
+		}
+		if chunk.labels.iter().any(|label| {
+			self
+				.config
+				.blocked_labels
+				.iter()
+				.any(|blocked| blocked == label)
+		}) {
+			return Err("chunk carries a blocked security label".into());
+		}
+		let user_allowed = action
+			.subject
+			.user_id
+			.as_ref()
+			.is_some_and(|user| chunk.allowed_users.iter().any(|allowed| allowed == user));
+		let agent_allowed = action
+			.subject
+			.agent_id
+			.as_ref()
+			.is_some_and(|agent| chunk.allowed_agents.iter().any(|allowed| allowed == agent));
+		let tenant_authenticated = chunk.allow_tenant_authenticated
+			&& (action.subject.user_id.is_some() || action.subject.agent_id.is_some());
+		if !(user_allowed || agent_allowed || tenant_authenticated) {
+			return Err("chunk ACL does not grant the verified user or agent access".into());
+		}
+		if current_tokens.saturating_add(chunk.token_count) > self.config.max_context_tokens {
+			return Err("chunk exceeds the context token budget".into());
+		}
+		Ok(())
+	}
+
+	fn deny<T>(
+		&self,
+		action: &security_types::ActionRequest,
+		query_hash: &str,
+		error: RetrievalError,
+	) -> Result<T, RetrievalError> {
+		self.audit.record(RetrievalAuditEvent {
+			request_id: action.request_id.clone(),
+			subject: action.subject.clone(),
+			corpus_id: action.resource.id.clone(),
+			query_hash: query_hash.to_string(),
+			outcome: RetrievalAuditOutcome::Denied,
+			accepted_chunk_ids: Vec::new(),
+			classification: None,
+			rejected: Vec::new(),
+			reason: Some(format!("{error:?}")),
+			timestamp: Utc::now(),
+		});
+		Err(error)
+	}
+}

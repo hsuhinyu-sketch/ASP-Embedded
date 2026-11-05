@@ -1,0 +1,188 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::blocking_client_cache::BlockingClientCache;
+use chrono::{DateTime, Utc};
+use security_pipeline::{ApprovalError, ApprovalProvider, arguments_hash};
+use security_types::{ActionRequest, ApprovalGrant};
+
+use crate::trusted_https;
+
+/// Trusted approval authority for high-risk Tool calls. It receives normalized request context and
+/// a hash of arguments, never a caller-provided approval header or raw Tool arguments.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteApprovalConfig {
+	pub endpoint: String,
+	#[serde(default = "default_timeout_millis")]
+	pub timeout_millis: u64,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub identity_pem_file: Option<PathBuf>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub root_ca_pem_file: Option<PathBuf>,
+	#[serde(skip, default = "default_provider_slot")]
+	provider: Arc<BlockingClientCache<HttpApprovalProvider>>,
+}
+
+const fn default_timeout_millis() -> u64 {
+	250
+}
+
+fn default_provider_slot() -> Arc<BlockingClientCache<HttpApprovalProvider>> {
+	Arc::new(BlockingClientCache::default())
+}
+
+impl RemoteApprovalConfig {
+	pub fn provider(&self) -> Result<HttpApprovalProvider, ApprovalError> {
+		match self
+			.provider
+			.get_or_init(|| HttpApprovalProvider::from_config(self).map_err(|error| error.reason))
+		{
+			Ok(provider) => Ok(provider.clone()),
+			Err(reason) => Err(ApprovalError::unavailable(reason.clone())),
+		}
+	}
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteApprovalRequest<'a> {
+	protocol_version: &'static str,
+	request: &'a ActionRequest,
+	arguments_hash: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteApprovalResponse {
+	approval_id: String,
+	request_id: String,
+	arguments_hash: String,
+	approved: bool,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	expires_at: Option<DateTime<Utc>>,
+}
+
+/// Blocking transport for the current synchronous security hook. Responses are bound to both the
+/// normalized request and the exact argument hash before an approval can be accepted.
+#[derive(Debug, Clone)]
+pub struct HttpApprovalProvider {
+	endpoint: String,
+	client: reqwest::blocking::Client,
+}
+
+impl HttpApprovalProvider {
+	pub(super) fn from_config(config: &RemoteApprovalConfig) -> Result<Self, ApprovalError> {
+		let (endpoint, client) = trusted_https::build_client(
+			&config.endpoint,
+			config.timeout_millis,
+			config.identity_pem_file.as_deref(),
+			config.root_ca_pem_file.as_deref(),
+			"approval authority",
+		)
+		.map_err(ApprovalError::unavailable)?;
+		Ok(Self { endpoint, client })
+	}
+}
+
+impl ApprovalProvider for HttpApprovalProvider {
+	fn approved(
+		&self,
+		request: &ActionRequest,
+		arguments: &serde_json::Value,
+	) -> Result<Option<ApprovalGrant>, ApprovalError> {
+		let expected_arguments_hash = arguments_hash(arguments);
+		let response = self
+			.client
+			.post(&self.endpoint)
+			.header(reqwest::header::ACCEPT, "application/json")
+			.json(&RemoteApprovalRequest {
+				protocol_version: "v1",
+				request,
+				arguments_hash: expected_arguments_hash.clone(),
+			})
+			.send()
+			.map_err(|error| ApprovalError::unavailable(format!("approval request failed: {error}")))?
+			.error_for_status()
+			.map_err(|error| {
+				ApprovalError::unavailable(format!(
+					"approval authority returned an error status: {error}"
+				))
+			})?
+			.json::<RemoteApprovalResponse>()
+			.map_err(|error| {
+				ApprovalError::unavailable(format!("approval response is invalid: {error}"))
+			})?;
+		validate_response(&response, request, &expected_arguments_hash)
+	}
+}
+
+fn validate_response(
+	response: &RemoteApprovalResponse,
+	request: &ActionRequest,
+	expected_arguments_hash: &str,
+) -> Result<Option<ApprovalGrant>, ApprovalError> {
+	if response.approval_id.is_empty() {
+		return Err(ApprovalError::unavailable(
+			"approval response approvalId is empty",
+		));
+	}
+	if response.request_id != request.request_id {
+		return Err(ApprovalError::unavailable(
+			"approval response requestId does not match",
+		));
+	}
+	if response.arguments_hash != expected_arguments_hash {
+		return Err(ApprovalError::unavailable(
+			"approval response argumentsHash does not match",
+		));
+	}
+	if response.approved
+		&& response
+			.expires_at
+			.is_none_or(|expires_at| expires_at <= Utc::now())
+	{
+		return Err(ApprovalError::unavailable(
+			"approval response is missing a future expiresAt",
+		));
+	}
+	Ok(if response.approved {
+		Some(ApprovalGrant {
+			approval_id: response.approval_id.clone(),
+			expires_at: response.expires_at.expect("future expiry validated"),
+		})
+	} else {
+		None
+	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	#[test]
+	fn approved_receipt_preserves_id_and_deadline_and_rejects_invalid_binding() {
+		let request =
+			security_pipeline::tool_invoke_for_identity("request", Default::default(), "delete");
+		let mut response = RemoteApprovalResponse {
+			approval_id: "approval-42".into(),
+			request_id: "request".into(),
+			arguments_hash: "hash".into(),
+			approved: true,
+			expires_at: Some(Utc::now() + chrono::Duration::seconds(2)),
+		};
+		let receipt = validate_response(&response, &request, "hash")
+			.unwrap()
+			.unwrap();
+		assert_eq!(receipt.approval_id, response.approval_id);
+		assert_eq!(Some(receipt.expires_at), response.expires_at);
+		assert!(validate_response(&response, &request, "other").is_err());
+		response.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+		assert!(validate_response(&response, &request, "hash").is_err());
+		response.approved = false;
+		assert!(
+			validate_response(&response, &request, "hash")
+				.unwrap()
+				.is_none()
+		);
+	}
+}

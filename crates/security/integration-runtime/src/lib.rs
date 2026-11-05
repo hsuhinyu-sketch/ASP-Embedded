@@ -1,0 +1,898 @@
+use std::sync::Arc;
+
+use security_audit::{AuditSink, event_from_decision};
+use security_pipeline::{
+	AgentIdentityRegistry, AgentIdentityRegistryConfig, Authorizer, DelegationRevocationCheck,
+	ExternalAgentIdentityCheck, GatewayError, RuntimeSecurityControls, SecurityPipelineConfig,
+};
+use security_types::{ActionRequest, Decision, DecisionEffect, SecurityEvent};
+
+pub mod a2a_objects;
+mod blocking_client_cache;
+mod config_identity;
+mod config_input;
+pub mod context_store;
+pub mod cross_component;
+mod data_egress;
+pub mod dependency_egress;
+pub mod execution_budget;
+pub mod identity_binding;
+pub mod mcp_sessions;
+pub mod pii;
+mod prepared;
+#[cfg(feature = "rag-sqlite")]
+pub mod rag_sqlite;
+mod remote_worker;
+pub mod required_audit;
+pub mod task_cleanup;
+pub use data_egress::{DataEgressConfig, check_data_egress};
+pub use security_types::DataClassification;
+pub mod remote_agent_identity;
+pub mod remote_approval;
+pub mod remote_capability;
+pub mod remote_pdp;
+pub mod remote_revocation;
+mod trusted_https;
+
+pub use remote_agent_identity::RemoteAgentIdentityConfig;
+pub use remote_approval::RemoteApprovalConfig;
+pub use remote_capability::{CapabilityGrant, RemoteCapabilityBrokerConfig};
+pub use remote_pdp::RemotePdpConfig;
+pub use remote_revocation::RemoteDelegationRevocationConfig;
+
+/// Runtime-neutral structured audit sink for gateway security decisions.
+#[derive(Clone, Copy, Default)]
+pub struct TracingAuditSink;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SecurityMode {
+	/// Record decisions without changing request processing.
+	#[default]
+	Audit,
+	/// Record decisions and warn whenever the same policy would deny in enforce mode.
+	Shadow,
+	/// Return policy and control denials to the gateway adapter for request rejection.
+	Enforce,
+}
+
+/// Owns a declaration and its reusable static results. Mutable access invalidates those results.
+#[derive(Clone, Default, serde::Serialize)]
+#[serde(transparent)]
+pub struct SecurityConfig {
+	data: SecurityConfigData,
+	#[serde(skip)]
+	validated: std::sync::OnceLock<()>,
+	#[serde(skip)]
+	identity: std::sync::OnceLock<Arc<config_identity::ConfigurationIdentity>>,
+	#[serde(skip)]
+	prepared: std::sync::OnceLock<Arc<prepared::PreparedSecurity>>,
+}
+
+/// System-level common security declaration. Protocol-specific controls remain separate.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityConfigData {
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub pii: Option<pii::PiiConfiguration>,
+	#[cfg(feature = "pii")]
+	#[serde(skip)]
+	pub pii_runtime: pii::PreparedPii,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub required_audit: Option<required_audit::RequiredAuditConfig>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub dependency_egress: Option<dependency_egress::DependencyEgressConfig>,
+	/// Opt-in, identity-bound workflow budgets shared by actual gateway executions.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub execution_budget: Option<execution_budget::ExecutionBudgetConfig>,
+	/// Opt-in, fail-closed RAG-issued contexts required on downstream gateway requests.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cross_component: Option<cross_component::CrossComponentConfig>,
+	/// Opt-in, current-identity MCP session ownership and response-stream protection.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mcp_sessions: Option<mcp_sessions::McpSessionConfig>,
+	/// Opt-in, fail-closed A2A JSON-RPC Task/Artifact ownership and lifecycle contract.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub a2a_objects: Option<a2a_objects::A2aObjectConfig>,
+	/// Runtime store handle shared by cloned policies; durable metadata is optional.
+	/// The handle/internal state is never accepted from configuration.
+	#[serde(skip)]
+	pub a2a_task_store: a2a_objects::TaskStoreHandle,
+	#[serde(default)]
+	pub mode: SecurityMode,
+	/// Optional trusted HTTPS PDP used instead of the in-process dynamic PDP.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub remote_pdp: Option<RemotePdpConfig>,
+	/// Optional shared source for immediate, cross-instance delegation revocation.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub delegation_revocation: Option<RemoteDelegationRevocationConfig>,
+	/// Optional trusted authority for configured high-risk Tool approval gates.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub approval: Option<RemoteApprovalConfig>,
+	/// Optional shared broker issuing one-time capabilities for approved high-risk Tool calls.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub capability_broker: Option<RemoteCapabilityBrokerConfig>,
+	/// Optional registered Agent identity source. It binds a verified JWT Agent claim to an enabled
+	/// tenant-scoped Agent principal and an allowed OAuth client/workload identity.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub agent_identity: Option<AgentIdentityRegistryConfig>,
+	/// Optional authoritative HTTPS/mTLS Agent Directory. This cannot be combined with the local
+	/// static `agentIdentity` registry because two sources could disagree about a principal.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub remote_agent_identity: Option<RemoteAgentIdentityConfig>,
+	/// Administrator-assigned data classification and exact outbound allowlists.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub data_egress: Option<DataEgressConfig>,
+	#[serde(flatten)]
+	pub pipeline: SecurityPipelineConfig,
+}
+
+impl SecurityConfig {
+	/// A deployment may apply this additional transport restriction to nested provider policies
+	/// without replacing their business authorizer or creating any remote client.
+	pub fn check_dependency_endpoints(
+		&self,
+		egress: &dependency_egress::DependencyEgressConfig,
+	) -> Result<(), String> {
+		use dependency_egress::DependencyKind as D;
+		#[cfg(feature = "pii")]
+		if let Some(pii) = &self.pii
+			&& pii.active()
+			&& pii.backend == security_pii::DetectorBackend::Presidio
+		{
+			egress.check_url(
+				D::Guardrail,
+				pii
+					.presidio_endpoint
+					.as_deref()
+					.ok_or("PII endpoint is required")?,
+			)?;
+		}
+		for (kind, endpoint) in [
+			(
+				D::Pdp,
+				self.remote_pdp.as_ref().map(|c| c.endpoint.as_str()),
+			),
+			(
+				D::AgentDirectory,
+				self
+					.remote_agent_identity
+					.as_ref()
+					.map(|c| c.endpoint.as_str()),
+			),
+			(
+				D::Approval,
+				self.approval.as_ref().map(|c| c.endpoint.as_str()),
+			),
+			(
+				D::Revocation,
+				self
+					.delegation_revocation
+					.as_ref()
+					.map(|c| c.endpoint.as_str()),
+			),
+			(
+				D::CapabilityBroker,
+				self
+					.capability_broker
+					.as_ref()
+					.map(|c| c.issue_endpoint.as_str()),
+			),
+		] {
+			if let Some(endpoint) = endpoint {
+				egress.check_url(kind, endpoint)?;
+			}
+		}
+		Ok(())
+	}
+	/// Explicit startup/embedding initialization; never silently fall back on storage errors.
+	pub fn prepare_a2a_store(&mut self) -> Result<(), String> {
+		self.prepare_runtime_stores()
+	}
+	/// Initialize all configured security stores; the older name remains an embedding alias.
+	pub fn prepare_runtime_stores(&mut self) -> Result<(), String> {
+		self.validate_composition()?;
+		// Only skipped runtime handles change here; the declaration and its identity stay intact.
+		let data = &mut self.data;
+		if let Some(budget) = &mut data.execution_budget {
+			budget.prepare_store()?;
+		}
+		if let Some(flow) = &mut data.cross_component {
+			flow.prepare_store()?;
+		}
+		if let Some(objects) = &mut data.a2a_objects {
+			data.a2a_task_store = a2a_objects::TaskStoreHandle::from_config(objects)?;
+			if let Some(events) = &mut objects.event_recovery {
+				events.prepare_store()?;
+			}
+			data
+				.a2a_task_store
+				.drain_push(objects)
+				.map_err(|e| format!("Push outbox recovery refused: {}", e.rule()))?;
+		}
+		Ok(())
+	}
+	/// Reject combinations that cannot enforce the declared security controls.
+	/// An approval gate without a provider remains valid: it intentionally denies by default.
+	pub fn validate_composition(&self) -> Result<(), String> {
+		if self.validated.get().is_some() {
+			return Ok(());
+		}
+		#[cfg(feature = "pii")]
+		self.pii_runtime.validate(self.pii.as_ref())?;
+		#[cfg(not(feature = "pii"))]
+		pii::validate(self.pii.as_ref())?;
+		if self
+			.mcp_sessions
+			.as_ref()
+			.and_then(|s| s.tasks.as_ref())
+			.is_some_and(|t| t.sampling.is_some())
+			&& self.execution_budget.is_none()
+		{
+			return Err("Gateway-managed Task sampling requires an executionBudget".into());
+		}
+		if self
+			.mcp_sessions
+			.as_ref()
+			.and_then(|s| s.tasks.as_ref())
+			.is_some_and(|t| t.interactive())
+			&& self
+				.execution_budget
+				.as_ref()
+				.is_some_and(|b| b.max_concurrent < 2)
+		{
+			return Err("MCP Task interactions require executionBudget.maxConcurrent >= 2 for the result stream and response".into());
+		}
+		if let Some(audit) = &self.required_audit {
+			if self.mode != SecurityMode::Enforce {
+				return Err("requiredAudit requires enforce mode".into());
+			}
+			audit.validate()?;
+		}
+		if let Some(egress) = &self.dependency_egress {
+			if self.mode != SecurityMode::Enforce {
+				return Err("dependencyEgress requires enforce mode".into());
+			}
+			egress.validate()?;
+			self.check_dependency_endpoints(egress)?;
+		}
+		if let Some(budget) = &self.execution_budget {
+			if self.mode != SecurityMode::Enforce {
+				return Err("executionBudget requires security.mode: enforce".into());
+			}
+			budget.validate()?;
+			if budget.task_cleanup.is_some()
+				&& self.a2a_objects.is_none()
+				&& !self
+					.mcp_sessions
+					.as_ref()
+					.is_some_and(|s| s.tasks.is_some())
+			{
+				return Err("executionBudget.taskCleanup requires a2aObjects or mcpSessions.tasks".into());
+			}
+			if self
+				.pipeline
+				.dynamic_authorization
+				.as_ref()
+				.is_some_and(|p| p.failure_mode != security_pipeline::DynamicPdpFailureMode::FailClosed)
+			{
+				return Err("executionBudget requires dynamicAuthorization.failureMode: failClosed".into());
+			}
+		}
+		if let Some(flow) = &self.cross_component {
+			if self.mode != SecurityMode::Enforce {
+				return Err("crossComponent requires security.mode: enforce".into());
+			}
+			flow.validate()?;
+			if self
+				.pipeline
+				.dynamic_authorization
+				.as_ref()
+				.is_some_and(|p| p.failure_mode != security_pipeline::DynamicPdpFailureMode::FailClosed)
+			{
+				return Err("crossComponent requires dynamicAuthorization.failureMode: failClosed".into());
+			}
+		}
+		if let Some(sessions) = &self.mcp_sessions {
+			if self.mode != SecurityMode::Enforce {
+				return Err("mcpSessions requires security.mode: enforce".into());
+			}
+			sessions.validate()?;
+			if self
+				.pipeline
+				.dynamic_authorization
+				.as_ref()
+				.is_some_and(|p| p.failure_mode != security_pipeline::DynamicPdpFailureMode::FailClosed)
+			{
+				return Err("mcpSessions requires dynamicAuthorization.failureMode: failClosed".into());
+			}
+		}
+		if let Some(objects) = &self.a2a_objects {
+			if self.mode != SecurityMode::Enforce {
+				return Err("a2aObjects requires security.mode: enforce".into());
+			}
+			objects.validate()?;
+			if self
+				.pipeline
+				.dynamic_authorization
+				.as_ref()
+				.is_some_and(|p| p.failure_mode != security_pipeline::DynamicPdpFailureMode::FailClosed)
+			{
+				return Err("a2aObjects requires dynamicAuthorization.failureMode: failClosed".into());
+			}
+		}
+		if let Some(egress) = &self.data_egress {
+			if self.mode != SecurityMode::Enforce {
+				return Err("dataEgress requires security.mode: enforce".into());
+			}
+			egress.validate()?;
+		}
+		if self.agent_identity.is_some() && self.remote_agent_identity.is_some() {
+			return Err("configure either agentIdentity or remoteAgentIdentity, not both".into());
+		}
+		if self.remote_pdp.is_some() && self.pipeline.dynamic_authorization.is_none() {
+			return Err("remotePdp requires dynamicAuthorization".into());
+		}
+		if self.approval.is_some() && self.pipeline.required_tool_approvals.is_empty() {
+			return Err("approval requires at least one requiredToolApprovals entry".into());
+		}
+		if self.capability_broker.is_some() {
+			if self.mode != SecurityMode::Enforce {
+				return Err("capabilityBroker requires security.mode: enforce".into());
+			}
+			if self.pipeline.required_tool_approvals.is_empty() {
+				return Err("capabilityBroker requires requiredToolApprovals".into());
+			}
+			if self.approval.is_none() {
+				return Err("capabilityBroker requires a trusted approval provider".into());
+			}
+		}
+		let _ = self.validated.set(());
+		Ok(())
+	}
+}
+
+/// Adapts the full gateway security configuration to a protocol-specific security pipeline.
+///
+/// RAG uses this at each of its three action boundaries. It deliberately delegates to
+/// [`evaluate_with_arguments`] instead of reconstructing policies, so SecurityMode, remote PDP,
+/// agent-directory binding, and delegation-revocation controls behave consistently across gateway
+/// protocols.
+#[derive(Clone)]
+pub struct SecurityConfigAuthorizer {
+	config: Arc<SecurityConfig>,
+	audit: Arc<dyn AuditSink>,
+}
+
+impl SecurityConfigAuthorizer {
+	pub fn new(config: Arc<SecurityConfig>) -> Self {
+		Self::with_audit(config, TracingAuditSink)
+	}
+
+	pub fn with_audit(config: Arc<SecurityConfig>, audit: impl AuditSink + 'static) -> Self {
+		Self {
+			config,
+			audit: Arc::new(audit),
+		}
+	}
+}
+
+impl Authorizer for SecurityConfigAuthorizer {
+	fn decide(&self, request: &ActionRequest) -> Decision {
+		runtime_decision(
+			request,
+			evaluate_with_audit(&self.config, request, None, self.audit.as_ref()),
+		)
+	}
+	fn decide_async<'a>(
+		&'a self,
+		request: &'a ActionRequest,
+	) -> std::pin::Pin<Box<dyn std::future::Future<Output = Decision> + Send + 'a>> {
+		Box::pin(async move {
+			runtime_decision(
+				request,
+				evaluate_with_audit_async(
+					self.config.clone(),
+					request.clone(),
+					None,
+					self.audit.clone(),
+				)
+				.await,
+			)
+		})
+	}
+}
+
+fn runtime_decision(request: &ActionRequest, result: Result<(), GatewayError>) -> Decision {
+	match result {
+		Ok(()) => Decision {
+			approval: None,
+			request_id: request.request_id.clone(),
+			effect: DecisionEffect::Allow,
+			policy_id: Some("security:runtime".into()),
+			policy_version: None,
+			expires_at: None,
+		},
+		Err(GatewayError::Denied(decision) | GatewayError::DeniedByControl { decision, .. }) => {
+			decision
+		},
+		Err(GatewayError::Capability(_) | GatewayError::CapabilityUnavailable) => Decision {
+			approval: None,
+			request_id: request.request_id.clone(),
+			effect: DecisionEffect::Deny,
+			policy_id: Some("security:runtime-unavailable".into()),
+			policy_version: None,
+			expires_at: None,
+		},
+	}
+}
+
+impl AuditSink for TracingAuditSink {
+	fn record(&self, event: SecurityEvent) {
+		tracing::info!(
+			target: "security_audit",
+			event_id = %event.event_id,
+			request_id = %event.request_id,
+			user_id = ?event.subject.user_id,
+			agent_id = ?event.subject.agent_id,
+			tenant_id = ?event.subject.tenant_id,
+			delegation_id = ?event.subject.delegation_id,
+			session_id = ?event.authorization_context.session_id,
+			client_id = ?event.authorization_context.client_id,
+			approval = ?event.authorization_context.approval,
+			action = ?event.action.action_type,
+			resource = %event.resource.id,
+			decision = ?event.decision,
+			policy_id = ?event.policy_id,
+			policy_version = ?event.policy_version,
+			decision_expires_at = ?event.decision_expires_at,
+			"security audit decision"
+		);
+	}
+}
+
+/// Evaluate and record a decision. Only enforce mode changes caller control flow.
+pub fn evaluate(config: &SecurityConfig, action: &ActionRequest) -> Result<(), GatewayError> {
+	evaluate_with_arguments(config, action, None)
+}
+
+/// Shared routing boundary: candidates never invoke remote providers or action controls.
+/// Dispatch and Continuation evaluate full authorization and configured durable audit admission.
+pub fn evaluate_at_stage(
+	config: &SecurityConfig,
+	stage: security_types::CheckStage,
+	action: &ActionRequest,
+	arguments: Option<&serde_json::Value>,
+	audit: &dyn AuditSink,
+) -> Result<(), GatewayError> {
+	match stage {
+		security_types::CheckStage::Candidate => prefilter_with_audit(config, action, audit),
+		security_types::CheckStage::Dispatch | security_types::CheckStage::Continuation => {
+			evaluate_with_audit(config, action, arguments, audit)
+		},
+	}
+}
+
+/// Cheap necessary-condition check, not an authorization grant. Reuses the existing static
+/// authorizer; never invokes PDP, directory, revocation, approval or capability providers.
+pub fn prefilter_with_audit(
+	config: &SecurityConfig,
+	action: &ActionRequest,
+	audit: &dyn AuditSink,
+) -> Result<(), GatewayError> {
+	let mut decision = config.pipeline.prefilter(action);
+	decision.policy_id = Some(format!(
+		"prefilter:{}",
+		decision.policy_id.as_deref().unwrap_or("default-deny")
+	));
+	audit.record(event_from_decision(
+		format!("{}:prefilter:{}", action.request_id, action.resource.id),
+		action,
+		&decision,
+	));
+	if decision.effect == DecisionEffect::Deny && config.mode == SecurityMode::Enforce {
+		Err(GatewayError::Denied(decision))
+	} else {
+		Ok(())
+	}
+}
+
+/// Record an operation that a protected protocol adapter cannot safely normalize.
+/// Broad policy grants cannot override this execution boundary. Observe-only modes retain
+/// forwarding behavior; enforce mode refuses the operation before backend execution.
+pub fn unsupported_operation_with_audit(
+	config: &SecurityConfig,
+	action: &ActionRequest,
+	adapter: &str,
+	audit: &dyn AuditSink,
+) -> Result<(), GatewayError> {
+	let decision = Decision {
+		approval: None,
+		request_id: action.request_id.clone(),
+		effect: DecisionEffect::Deny,
+		policy_id: Some(format!("adapter:{adapter}:unsupported-operation")),
+		policy_version: None,
+		expires_at: None,
+	};
+	audit.record(event_from_decision(
+		format!("{}:adapter:{adapter}", action.request_id),
+		action,
+		&decision,
+	));
+	match config.mode {
+		SecurityMode::Enforce => Err(GatewayError::Denied(decision)),
+		SecurityMode::Shadow => {
+			tracing::warn!(adapter, request_id = %action.request_id, "unsupported operation would be denied in enforce mode");
+			Ok(())
+		},
+		SecurityMode::Audit => Ok(()),
+	}
+}
+
+/// Evaluate a protocol action with optional structured arguments.
+///
+/// Tool adapters use this to apply shared argument controls in addition to policy matching.
+pub fn evaluate_with_arguments(
+	config: &SecurityConfig,
+	action: &ActionRequest,
+	arguments: Option<&serde_json::Value>,
+) -> Result<(), GatewayError> {
+	evaluate_with_audit(config, action, arguments, &TracingAuditSink)
+}
+
+/// Evaluates a protocol action and writes its redacted decision to the caller-selected audit
+/// destination. This lets a runtime fan the same authoritative decision out to tracing and an
+/// administrative event feed without duplicating policy evaluation.
+pub fn evaluate_with_audit(
+	config: &SecurityConfig,
+	action: &ActionRequest,
+	arguments: Option<&serde_json::Value>,
+	audit: &dyn AuditSink,
+) -> Result<(), GatewayError> {
+	evaluate_decision(config, action, arguments, audit).map(|_| ())
+}
+
+fn evaluate_decision(
+	config: &SecurityConfig,
+	action: &ActionRequest,
+	arguments: Option<&serde_json::Value>,
+	audit: &dyn AuditSink,
+) -> Result<Option<Decision>, GatewayError> {
+	if config.required_audit.is_some() && config.mode != SecurityMode::Enforce {
+		return Err(configuration_denial(
+			action,
+			"requiredAudit requires enforce mode".into(),
+			audit,
+		));
+	}
+	if has_remote_evaluation(config) {
+		let result = on_blocking_security_thread(action, audit, || {
+			evaluate_with_audit_inner(config, action, arguments, audit)
+		});
+		return if config.mode == SecurityMode::Enforce {
+			result
+		} else {
+			// Worker saturation is still audited, but observe-only modes do not interrupt traffic.
+			Ok(None)
+		};
+	}
+	evaluate_with_audit_inner(config, action, arguments, audit)
+}
+
+fn has_remote_evaluation(config: &SecurityConfig) -> bool {
+	config.remote_pdp.is_some()
+		|| config.remote_agent_identity.is_some()
+		|| config.delegation_revocation.is_some()
+		|| config.approval.is_some()
+}
+
+/// Await remote evaluation without blocking the caller's Tokio worker. The owned snapshot and
+/// audit destination outlive cancellation of the waiter; running HTTP work retains its admission
+/// slot until it actually ends. An Allow still requires the caller's final lifecycle checks.
+pub async fn evaluate_with_audit_async(
+	config: Arc<SecurityConfig>,
+	action: ActionRequest,
+	arguments: Option<serde_json::Value>,
+	audit: Arc<dyn AuditSink>,
+) -> Result<(), GatewayError> {
+	evaluate_decision_async(config, action, arguments, audit)
+		.await
+		.map(|_| ())
+}
+
+async fn evaluate_decision_async(
+	config: Arc<SecurityConfig>,
+	action: ActionRequest,
+	arguments: Option<serde_json::Value>,
+	audit: Arc<dyn AuditSink>,
+) -> Result<Option<Decision>, GatewayError> {
+	if config.required_audit.is_some() && config.mode != SecurityMode::Enforce {
+		return Err(configuration_denial(
+			&action,
+			"requiredAudit requires enforce mode".into(),
+			audit.as_ref(),
+		));
+	}
+	if !has_remote_evaluation(&config) {
+		return evaluate_with_audit_inner(&config, &action, arguments.as_ref(), audit.as_ref());
+	}
+	let mode = config.mode;
+	let owned_action = action.clone();
+	let owned_audit = audit.clone();
+	let result = remote_worker::evaluate(move || {
+		evaluate_with_audit_inner(
+			&config,
+			&owned_action,
+			arguments.as_ref(),
+			owned_audit.as_ref(),
+		)
+	})
+	.await
+	.unwrap_or_else(|reason| Err(configuration_denial(&action, reason.into(), audit.as_ref())));
+	if mode == SecurityMode::Enforce {
+		result
+	} else {
+		Ok(None)
+	}
+}
+
+fn evaluate_with_audit_inner(
+	config: &SecurityConfig,
+	action: &ActionRequest,
+	arguments: Option<&serde_json::Value>,
+	audit: &dyn AuditSink,
+) -> Result<Option<Decision>, GatewayError> {
+	let decision = (|| {
+		let controls = runtime_security_controls(config)
+			.map_err(|reason| configuration_denial(action, reason, audit))?;
+		let prepared = config
+			.prepared_security()
+			.map_err(|reason| configuration_denial(action, reason, audit))?;
+		match &config.remote_pdp {
+			Some(remote_pdp) => {
+				let transport = remote_pdp
+					.transport()
+					.map_err(|error| configuration_denial(action, error.reason, audit))?;
+				prepared
+					.pipeline
+					.build_with_remote_pdp_and_runtime_controls(audit, transport, controls)
+					.map_err(|error| configuration_denial(action, error.reason, audit))?
+					.authorize(action, arguments)
+			},
+			None => prepared
+				.pipeline
+				.build_with_runtime_controls(audit, controls)
+				.authorize(action, arguments),
+		}
+	})();
+	match decision {
+		Ok(decision) => {
+			if let Some(required) = &config.required_audit {
+				required_audit::acknowledge(required, action, &decision, audit)?;
+			}
+			Ok(Some(decision))
+		},
+		Err(error) => match config.mode {
+			SecurityMode::Audit => Ok(None),
+			SecurityMode::Shadow => {
+				tracing::warn!(
+					target: "security_audit",
+					request_id = %action.request_id,
+					error = ?error,
+					"security shadow policy would deny request"
+				);
+				Ok(None)
+			},
+			SecurityMode::Enforce => Err(error),
+		},
+	}
+}
+
+/// Enforces a Tool call, then issues an opaque capability only for a configured high-risk Tool in
+/// enforce mode. Audit and shadow modes never mint a credential that could reach a protected API.
+pub fn authorize_tool_with_capability(
+	config: &SecurityConfig,
+	action: &ActionRequest,
+	arguments: &serde_json::Value,
+) -> Result<Option<CapabilityGrant>, GatewayError> {
+	authorize_tool_with_capability_with_audit(config, action, arguments, &TracingAuditSink)
+}
+
+/// Tool authorization variant that writes its authoritative policy decision to a caller-selected
+/// audit sink. The capability itself is intentionally never included in audit data.
+pub fn authorize_tool_with_capability_with_audit(
+	config: &SecurityConfig,
+	action: &ActionRequest,
+	arguments: &serde_json::Value,
+	audit: &dyn AuditSink,
+) -> Result<Option<CapabilityGrant>, GatewayError> {
+	let decision = evaluate_decision(config, action, Some(arguments), audit)?;
+	if config.mode != SecurityMode::Enforce || !config.pipeline.requires_tool_approval(action) {
+		return Ok(None);
+	}
+	let Some(broker) = &config.capability_broker else {
+		return Ok(None);
+	};
+	on_blocking_security_thread(action, audit, || {
+		issue_capability(broker, action, arguments, decision.as_ref(), audit)
+	})
+}
+
+/// Await authorization/approval, then issue a capability through the same bounded remote worker.
+/// Dropping the waiter never installs a grant into the caller's request. The caller must recheck
+/// its live session, configuration and execution state before publishing or using the result.
+pub async fn authorize_tool_with_capability_with_audit_async(
+	config: Arc<SecurityConfig>,
+	action: ActionRequest,
+	arguments: serde_json::Value,
+	audit: Arc<dyn AuditSink>,
+) -> Result<Option<CapabilityGrant>, GatewayError> {
+	let decision = evaluate_decision_async(
+		config.clone(),
+		action.clone(),
+		Some(arguments.clone()),
+		audit.clone(),
+	)
+	.await?;
+	if config.mode != SecurityMode::Enforce || !config.pipeline.requires_tool_approval(&action) {
+		return Ok(None);
+	}
+	let Some(broker) = config.capability_broker.clone() else {
+		return Ok(None);
+	};
+	let owned_action = action.clone();
+	let owned_audit = audit.clone();
+	remote_worker::evaluate(move || {
+		issue_capability(
+			&broker,
+			&owned_action,
+			&arguments,
+			decision.as_ref(),
+			owned_audit.as_ref(),
+		)
+	})
+	.await
+	.unwrap_or_else(|reason| Err(configuration_denial(&action, reason.into(), audit.as_ref())))
+}
+
+fn issue_capability(
+	broker: &RemoteCapabilityBrokerConfig,
+	action: &ActionRequest,
+	arguments: &serde_json::Value,
+	decision: Option<&Decision>,
+	audit: &dyn AuditSink,
+) -> Result<Option<CapabilityGrant>, GatewayError> {
+	let approval = decision
+		.and_then(|d| d.approval.clone())
+		.ok_or_else(|| capability_denial(action, "missing trusted approval receipt".into(), audit))?;
+	let mut bound_action = action.clone();
+	bound_action.authorization_context.approval = Some(approval);
+	let issuer = broker
+		.issuer()
+		.map_err(|error| capability_denial(action, error.reason, audit))?;
+	issuer
+		.issue(&bound_action, arguments)
+		.map(Some)
+		.map_err(|error| capability_denial(action, error.reason, audit))
+}
+
+/// Keep synchronous remote-provider traits usable from every protocol adapter, including RAG.
+/// Requests beyond the bounded bridge are denied rather than spawning unbounded OS threads.
+fn on_blocking_security_thread<T: Send>(
+	action: &ActionRequest,
+	audit: &dyn AuditSink,
+	work: impl FnOnce() -> Result<T, GatewayError> + Send,
+) -> Result<T, GatewayError> {
+	if tokio::runtime::Handle::try_current().is_err() {
+		return work();
+	}
+	let _permit = remote_worker::reserve()
+		.map_err(|reason| configuration_denial(action, reason.into(), audit))?;
+	let run = || std::thread::scope(|scope| scope.spawn(work).join());
+	let result = if tokio::runtime::Handle::current().runtime_flavor()
+		== tokio::runtime::RuntimeFlavor::MultiThread
+	{
+		tokio::task::block_in_place(run)
+	} else {
+		run()
+	};
+	result.unwrap_or_else(|_| {
+		Err(configuration_denial(
+			action,
+			"remote security worker failed".into(),
+			audit,
+		))
+	})
+}
+
+fn runtime_security_controls(config: &SecurityConfig) -> Result<RuntimeSecurityControls, String> {
+	if config.dependency_egress.is_some() || config.required_audit.is_some() {
+		config.validate_composition()?;
+	}
+	let mut controls = RuntimeSecurityControls::default();
+	if config.agent_identity.is_some() && config.remote_agent_identity.is_some() {
+		return Err("configure either agentIdentity or remoteAgentIdentity, not both".into());
+	}
+	if let Some(registry) = &config.prepared_security()?.registry {
+		controls = controls.add_identity_control(registry.clone());
+	}
+	if let Some(remote_agent_identity) = &config.remote_agent_identity {
+		let provider = remote_agent_identity
+			.provider()
+			.map_err(|error| error.reason)?;
+		controls = controls.add_identity_control(ExternalAgentIdentityCheck::new(
+			remote_agent_identity.required,
+			provider,
+		));
+	}
+	if let Some(revocation) = &config.delegation_revocation {
+		let provider = revocation.provider().map_err(|error| error.reason)?;
+		controls = controls.add_identity_control(DelegationRevocationCheck::new(provider));
+	}
+	if let Some(approval) = &config.approval {
+		let provider = approval.provider().map_err(|error| error.reason)?;
+		controls = controls.with_approval_provider(provider);
+	}
+	Ok(controls)
+}
+
+fn configuration_denial(
+	action: &ActionRequest,
+	reason: String,
+	audit: &dyn AuditSink,
+) -> GatewayError {
+	tracing::error!(
+		target: "security_audit",
+		request_id = %action.request_id,
+		error = %reason,
+		"external security configuration is invalid"
+	);
+	let decision = Decision {
+		approval: None,
+		request_id: action.request_id.clone(),
+		effect: DecisionEffect::Deny,
+		policy_id: Some("security:configuration".into()),
+		policy_version: None,
+		expires_at: None,
+	};
+	audit.record(event_from_decision(
+		format!("{}:security-configuration", action.request_id),
+		action,
+		&decision,
+	));
+	GatewayError::Denied(decision)
+}
+
+fn capability_denial(
+	action: &ActionRequest,
+	reason: String,
+	audit: &dyn AuditSink,
+) -> GatewayError {
+	tracing::error!(
+		target: "security_audit",
+		request_id = %action.request_id,
+		error = %reason,
+		"capability broker could not issue a required Tool capability"
+	);
+	let decision = Decision {
+		approval: None,
+		request_id: action.request_id.clone(),
+		effect: DecisionEffect::Deny,
+		policy_id: Some("security:capability-broker".into()),
+		policy_version: None,
+		expires_at: None,
+	};
+	audit.record(event_from_decision(
+		format!("{}:capability-broker", action.request_id),
+		action,
+		&decision,
+	));
+	GatewayError::Denied(decision)
+}
+
+#[cfg(test)]
+#[path = "execution_tests.rs"]
+mod execution_tests;
+
+#[cfg(test)]
+mod lifecycle_tests;
