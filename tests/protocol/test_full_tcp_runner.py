@@ -19,7 +19,7 @@ import run_full_tcp as runner
 class GateTests(unittest.TestCase):
     def test_profile_cannot_pass_using_another_profiles_case_count(self):
         clock = {"wallNs":100,"monotonicNs":100}
-        for profile, (_, expected) in runner.PROFILES.items():
+        for profile, (_, expected, *_) in runner.PROFILES.items():
             report = {"successful":True,"testsRun":expected,"errors":[],"failures":[],"skipped":[]}
             self.assertEqual(runner.check_round(report,0,clock,clock,expected), [], profile)
             report['testsRun'] -= 1

@@ -61,7 +61,7 @@ assert 'fn parse_operation' not in objects_host and 'fn validate_parts' not in o
 assert 'gateway_a2a::execution::process_rpc' in objects_host and 'gateway_a2a::objects::parse_request' in objects_host
 streaming_host=Path('crates/gateway/runtime/src/a2a/objects/streaming.rs').read_text()
 assert 'gateway_a2a::streaming::process_event' in streaming_host and 'fn validate_artifact' not in streaming_host
-ordered = [streaming_host.index('call.process_event(&mut rpc)?'), streaming_host.index('call.project_event(rpc.get_mut("result"))?'), streaming_host.index('call.record_event(&rpc)'), streaming_host.rindex('call.check_continuation()?'), streaming_host.index('crate::parse::encode_sse_event'), streaming_host.index('Some((')]
+ordered = [streaming_host.index('call.process_event(&mut rpc)?'), streaming_host.index('call.project_event(rpc.get_mut("result"))?'), streaming_host.index('call.record_event(&rpc)'), streaming_host.rindex('call.check_continuation().await?'), streaming_host.index('crate::parse::encode_sse_event'), streaming_host.index('Some((')]
 assert ordered == sorted(ordered), 'A2A projection/persistence/final continuation/output ordering changed'
 assert 'TaskState' in Path('crates/security/types/src/a2a.rs').read_text()
 assert 'pub enum TaskState' not in Path('crates/security/integration-runtime/src/a2a_objects.rs').read_text()
@@ -243,6 +243,9 @@ for consumer in ("llm/policy/webhook.rs", "http/auth/oauth/transport.rs"):
 compact_proxy = "".join(proxy_source.split())
 assert "crate::mcp::dispatch::verify(&mutreq," in compact_proxy
 assert compact_proxy.index("scope.reserve(*kind,action)?") < compact_proxy.index("crate::mcp::dispatch::before_send(&call.req)?") < compact_proxy.index("upstream.call(call),")
+send = compact_proxy.index("crate::mcp::dispatch::before_send(&call.req)?")
+assert compact_proxy.index("guard.check_response_current(&response_target).await?") < compact_proxy.index("crate::mcp::dispatch::authorize_send(&super::routing_security::request_head(&call.req)).await?") < send
+assert ".await" not in compact_proxy[send:compact_proxy.index("upstream.call(call),")], "final MCP checks must follow awaited Context checks"
 assert "ProxyInputs" not in Path("crates/gateway/runtime/src/app.rs").read_text()
 assert "inputs.model_catalog" not in Path("crates/gateway/runtime/src/proxy/tcpproxy.rs").read_text()
 print("RuntimeContext: no owned protocol state; policy client capabilities and shared execution contract remain narrow")
@@ -425,6 +428,18 @@ for features in (
                 "opentelemetry_sdk", "opentelemetry-proto"} & names, (
         f"disabled infrastructure retained in {features}")
 print("Scenario infrastructure: disabled SQL/OTLP absent from transitive production graphs")
+
+for protocol in ("gateway-llm", "gateway-rag"):
+    tree = cargo("tree", "--offline", "-p", "ai-security-platform-app", "--no-default-features",
+                 "--features", f"{protocol},security-s1,tls-aws-lc,security-rag-sqlite",
+                 "--edges", "normal", "--prefix", "none")
+    names = {line.split()[0] for line in tree.splitlines() if line.strip()}
+    assert {"security-rag", "sqlx-sqlite"} <= names
+    forbidden = {"gateway-mcp", "gateway-a2a", "sqlx-postgres", "sqlx-mysql"}
+    if protocol == "gateway-llm":
+        forbidden.add("gateway-rag")
+    assert not forbidden & names, f"joint state pulled unrelated components into {protocol}: {forbidden & names}"
+print("Joint RAG state: SQLite-only storage composes with LLM or RAG without sibling protocol adapters")
 
 # RAG uses the same fully prepared config publication and managed dependency scope as other
 # Host protocols. A startup-only parse would leave policy/JWT/ContextGuard snapshots stale.

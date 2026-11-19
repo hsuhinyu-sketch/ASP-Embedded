@@ -10,9 +10,11 @@ publish.workspace = true
 default = []
 pii = ["dep:security-pii"]
 a2a-sqlite = ["dep:sqlx"]
-rag-sqlite = ["dep:sqlx", "dep:security-rag"]
+rag-sqlite = ["dep:sqlx", "dep:security-rag", "dep:async-trait", "dep:base64"]
 
 [dependencies]
+base64 = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
 security-pii = { path = "../pii", optional = true }
 security-audit = { path = "../audit" }
 security-pipeline = { path = "../pipeline" }

@@ -163,6 +163,7 @@ fn admin_router(state: Arc<AdminState>) -> Router {
 	let router = router
 		.route("/debug/pprof/heap", get(handle_heap_pprof))
 		.route("/memory", get(handle_memory))
+		.route("/api/security/audit", get(handle_security_audit))
 		.route("/quitquitquit", post(handle_server_shutdown))
 		.route("/debug/tasks", get(handle_tokio_tasks))
 		.route("/debug/trace", post(handle_debug_trace))
@@ -485,4 +486,15 @@ async fn handle_memory() -> Result<Response, AdminError> {
 			.body(body.into())
 			.expect("builder with known status code should not fail"),
 	)
+}
+
+async fn handle_security_audit() -> impl IntoResponse {
+	match crate::security_events::store().status() {
+		Ok(status) => (hyper::StatusCode::OK, axum::Json(status)).into_response(),
+		Err(_) => (
+			hyper::StatusCode::SERVICE_UNAVAILABLE,
+			"security audit status unavailable",
+		)
+			.into_response(),
+	}
 }

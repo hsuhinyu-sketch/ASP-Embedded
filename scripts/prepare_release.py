@@ -66,7 +66,8 @@ def package(binary, destination, version, profile, revision, target, info, comma
         for source, filename in ((ROOT / "LICENSE", "LICENSE"),
                                  (ROOT / "Cargo.lock", "Cargo.lock"),
                                  (ROOT / "docs/release/README.md", "RELEASE.md"),
-                                 (ROOT / "crates/platform/pool/LICENSE", "LICENSE-platform-pool")):
+                                 (ROOT / "crates/platform/pool/LICENSE", "LICENSE-platform-pool"),
+                                 (ROOT / "crates/third-party/regex-cache/LICENSE", "LICENSE-regex-cache")):
             shutil.copy2(source, staging / filename)
         manifest = {"version": version, "profile": profile, "features": PROFILES[profile].split(","),
                     "gitRevision": revision, "buildInfo": info, "buildCommand": command,

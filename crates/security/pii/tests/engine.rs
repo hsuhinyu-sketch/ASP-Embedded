@@ -32,6 +32,66 @@ impl PiiDetector for Broken {
 	}
 }
 
+struct SlowSynchronous;
+#[async_trait::async_trait]
+impl PiiDetector for SlowSynchronous {
+	async fn detect(&self, _: &str, _: &str) -> Result<Vec<PiiFinding>, PiiError> {
+		std::thread::sleep(std::time::Duration::from_millis(30));
+		Ok(vec![])
+	}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn synchronous_detector_cannot_report_late_success() {
+	for mode in [PiiMode::Enforce, PiiMode::Audit, PiiMode::Shadow] {
+		let mut cfg = config();
+		cfg.timeout_ms = 5;
+		cfg.mode = mode;
+		let engine = PiiEngine::with_detector(cfg, Arc::new(SlowSynchronous)).unwrap();
+		assert_eq!(engine.check_ready().await, Err(PiiError::Timeout));
+		if mode == PiiMode::Enforce {
+			assert!(matches!(
+				engine.inspect("sensitive").await,
+				Err(PiiError::Timeout)
+			));
+		} else {
+			let out = engine.inspect("sensitive").await.unwrap();
+			assert_eq!(out.text, "sensitive");
+			assert_eq!(out.detector_error, Some(PiiError::Timeout));
+			assert!(!out.modified && !out.blocked);
+		}
+	}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_scan_yields_without_changing_findings() {
+	let mut cfg = config();
+	cfg.timeout_ms = 30_000;
+	cfg.max_findings = 4096;
+	cfg
+		.policy
+		.entities
+		.retain(|entity, _| entity == "PHONE_NUMBER");
+	let engine = cfg.build().unwrap().unwrap();
+	let progressed = AtomicUsize::new(0);
+	let text = "13800138000 ".repeat(512);
+	let scan = async {
+		let out = engine.inspect(&text).await.unwrap();
+		assert_ne!(
+			progressed.load(Ordering::SeqCst),
+			0,
+			"scan monopolized its worker"
+		);
+		assert_eq!(out.findings.len(), 512);
+		assert_eq!(out.text, "[PHONE_NUMBER] ".repeat(512));
+	};
+	let peer = async {
+		tokio::task::yield_now().await;
+		progressed.store(1, Ordering::SeqCst);
+	};
+	tokio::join!(scan, peer);
+}
+
 #[tokio::test]
 async fn native_mixed_text_and_validated_phone_ip() {
 	let engine = config().build().unwrap().unwrap();
@@ -245,4 +305,118 @@ fn missing_backend_is_rejected_and_disabled_backend_is_not_required() {
 	assert!(matches!(cfg.build(), Err(PiiError::NotCompiled)));
 	cfg.enabled = false;
 	assert!(cfg.build().unwrap().is_none());
+}
+
+struct PreparingDetector {
+	started: tokio::sync::Notify,
+	release: tokio::sync::Notify,
+	prepared: std::sync::atomic::AtomicBool,
+	preparations: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl PiiDetector for PreparingDetector {
+	async fn prepare(&self) -> Result<(), PiiError> {
+		self.preparations.fetch_add(1, Ordering::SeqCst);
+		self.started.notify_one();
+		self.release.notified().await;
+		self.prepared.store(true, Ordering::SeqCst);
+		Ok(())
+	}
+	async fn detect(&self, _: &str, _: &str) -> Result<Vec<PiiFinding>, PiiError> {
+		assert!(self.prepared.load(Ordering::SeqCst));
+		Ok(vec![])
+	}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn readiness_awaits_preparation_without_repeating_it_on_requests() {
+	let detector = Arc::new(PreparingDetector {
+		started: Default::default(),
+		release: Default::default(),
+		prepared: Default::default(),
+		preparations: Default::default(),
+	});
+	let engine = Arc::new(PiiEngine::with_detector(config(), detector.clone()).unwrap());
+	let preparing = {
+		let engine = engine.clone();
+		tokio::spawn(async move { engine.check_ready().await })
+	};
+	detector.started.notified().await;
+	assert!(!preparing.is_finished());
+	detector.release.notify_one();
+	preparing.await.unwrap().unwrap();
+	assert_eq!(
+		engine.inspect("ordinary text").await.unwrap().text,
+		"ordinary text"
+	);
+	assert_eq!(detector.preparations.load(Ordering::SeqCst), 1);
+}
+
+struct PreparationFailure(AtomicUsize);
+#[async_trait::async_trait]
+impl PiiDetector for PreparationFailure {
+	async fn prepare(&self) -> Result<(), PiiError> {
+		Err(PiiError::Unavailable)
+	}
+	async fn detect(&self, _: &str, _: &str) -> Result<Vec<PiiFinding>, PiiError> {
+		self.0.fetch_add(1, Ordering::SeqCst);
+		Ok(vec![])
+	}
+}
+#[tokio::test]
+async fn preparation_failure_rejects_readiness_in_every_mode() {
+	for mode in [PiiMode::Enforce, PiiMode::Audit, PiiMode::Shadow] {
+		let mut cfg = config();
+		cfg.mode = mode;
+		let detector = Arc::new(PreparationFailure(AtomicUsize::new(0)));
+		let engine = PiiEngine::with_detector(cfg, detector.clone()).unwrap();
+		assert_eq!(engine.check_ready().await, Err(PiiError::Unavailable));
+		assert_eq!(detector.0.load(Ordering::SeqCst), 0);
+	}
+}
+
+#[test]
+fn only_phone_preparation_uses_the_blocking_pool_and_waits_for_it() {
+	for phone in [false, true] {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.max_blocking_threads(1)
+			.enable_all()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let (release, wait) = std::sync::mpsc::channel();
+			let (started, running) = tokio::sync::oneshot::channel();
+			let occupied = tokio::task::spawn_blocking(move || {
+				let _ = started.send(());
+				let _ = wait.recv();
+			});
+			running.await.unwrap();
+			let mut cfg = config();
+			cfg.policy.entities.retain(|entity, _| {
+				entity
+					== if phone {
+						"PHONE_NUMBER"
+					} else {
+						"EMAIL_ADDRESS"
+					}
+			});
+			let engine = cfg.build().unwrap().unwrap();
+			let mut ready = Box::pin(engine.check_ready());
+			let first = std::future::poll_fn(|cx| {
+				std::task::Poll::Ready(match ready.as_mut().poll(cx) {
+					std::task::Poll::Pending => None,
+					std::task::Poll::Ready(result) => Some(result),
+				})
+			})
+			.await;
+			let pending = first.is_none();
+			release.send(()).unwrap();
+			occupied.await.unwrap();
+			match first {
+				Some(result) => result.unwrap(),
+				None => ready.await.unwrap(),
+			}
+			assert_eq!(pending, phone);
+		});
+	}
 }

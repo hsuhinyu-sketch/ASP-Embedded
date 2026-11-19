@@ -99,6 +99,16 @@ pub(crate) struct MigrateArgs {
 	pub(crate) file: PathBuf,
 }
 
+#[derive(ClapArgs, Debug)]
+pub(crate) struct ExportAuditArgs {
+	/// Gateway YAML containing config.securityAudit. The Gateway must be stopped.
+	#[arg(short, long)]
+	pub(crate) file: PathBuf,
+	/// New, absolute archive directory outside the source audit directory.
+	#[arg(long)]
+	pub(crate) output: PathBuf,
+}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
 	/// Run agentgateway as a subprocess and exec a command when ready.
@@ -106,6 +116,11 @@ enum Commands {
 	Oneshot(OneshotArgs),
 	/// Migrate deprecated local config fields to frontendPolicies.
 	Migrate(MigrateArgs),
+	/// Offline validated copy of audit evidence; source retention and capacity are unchanged.
+	ExportAudit(ExportAuditArgs),
+	/// Offline import of paired Context/document JSONL journals into a NEW SQLite database.
+	#[cfg(feature = "security-rag-sqlite")]
+	ImportRagState(MigrateArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -126,6 +141,9 @@ pub fn run() -> anyhow::Result<()> {
 		#[cfg(target_os = "linux")]
 		Some(Commands::Oneshot(oneshot)) => commands::oneshot::execute(oneshot),
 		Some(Commands::Migrate(migrate)) => commands::migrate::execute(migrate),
+		Some(Commands::ExportAudit(args)) => commands::audit::export(args),
+		#[cfg(feature = "security-rag-sqlite")]
+		Some(Commands::ImportRagState(args)) => commands::migrate::import_rag_state(args),
 		None => commands::run::execute(args.run),
 	}
 }

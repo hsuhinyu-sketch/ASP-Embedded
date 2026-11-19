@@ -1629,11 +1629,7 @@ pub(super) async fn convert_llm_config(
 	listener_set.insert(listener);
 
 	// Create bind
-	let sockaddr = if cfg!(target_family = "unix") && config.ipv6_enabled {
-		SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
-	} else {
-		SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
-	};
+	let sockaddr = listener_address(config, port);
 
 	let bind = Bind {
 		key: strng::format!("bind/{}", port),

@@ -23,7 +23,7 @@ struct Plan {
 }
 
 impl AuthorizedCall {
-	fn download_live(&self, plan: &Plan) -> Result<(), ProxyError> {
+	async fn download_live(&self, plan: &Plan) -> Result<(), ProxyError> {
 		self.check_credential().map_err(|e| deny(&plan.action, e))?;
 		self
 			.config
@@ -59,18 +59,20 @@ impl AuthorizedCall {
 				.map_err(|_| ProxyError::AuthorizationFailed)?;
 		}
 		if let Some(guards) = &self.download_guards {
-			guards.authorize_artifact_download(
-				&self.config,
-				&[
-					&self.invocation,
-					&self.action,
-					&task_read,
-					&artifact_read,
+			guards
+				.authorize_artifact_download(
+					&self.config,
+					&[
+						&self.invocation,
+						&self.action,
+						&task_read,
+						&artifact_read,
+						&plan.action,
+					],
 					&plan.action,
-				],
-				&plan.action,
-				&plan.destination,
-			)?;
+					&plan.destination,
+				)
+				.await?;
 		}
 		if let Some(policy) = &self.config.data_egress {
 			security_integration_runtime::check_data_egress(
@@ -85,7 +87,7 @@ impl AuthorizedCall {
 			return Err(deny(&plan.action, ObjectError::DownloadSource));
 		}
 		if let Some(flow) = &self.flow {
-			flow.check(&plan.action, &plan.destination)?;
+			flow.check_async(&plan.action, &plan.destination).await?;
 		}
 		// Dynamic authorization may have waited. Do not extend credential/config lifetimes.
 		self.check_credential().map_err(|e| deny(&plan.action, e))?;
@@ -197,11 +199,11 @@ impl AuthorizedCall {
 			// All grants must pass before any GET. Yield between files so timers and
 			// cancellation can run; synchronous PDP calls retain their own IO timeout.
 			for plan in &plans {
-				self.download_live(plan)?;
+				self.download_live(plan).await?;
 				tokio::task::yield_now().await;
 			}
 			for plan in &plans {
-				self.download_live(plan)?;
+				self.download_live(plan).await?;
 				if tokio::time::Instant::now() >= deadline {
 					return Err(deny(&plan.action, ObjectError::StreamTimeout));
 				}
@@ -216,7 +218,7 @@ impl AuthorizedCall {
 					})
 					.transpose()?;
 				let bytes = self.fetch_file(plan, cfg, deadline).await?;
-				self.download_live(plan)?;
+				self.download_live(plan).await?;
 				let file = rpc["result"]["artifacts"][plan.artifact]["parts"][plan.part]["file"]
 					.as_object_mut()
 					.expect("validated");
@@ -229,7 +231,7 @@ impl AuthorizedCall {
 			}
 			// The first file's permit/context may change while later files are pending.
 			for plan in &plans {
-				self.download_live(plan)?;
+				self.download_live(plan).await?;
 			}
 			if tokio::time::Instant::now() >= deadline {
 				return Err(deny(&self.action, ObjectError::StreamTimeout));
@@ -359,7 +361,7 @@ impl AuthorizedCall {
 			tokio::select! {
 				biased;
 				_ = interval.tick() => {
-					self.download_live(plan)?;
+					self.download_live(plan).await?;
 					if tokio::time::Instant::now() >= deadline { return Err(fail(ObjectError::StreamTimeout)); }
 				},
 				result = &mut receive => return result,

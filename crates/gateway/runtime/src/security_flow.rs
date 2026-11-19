@@ -27,6 +27,10 @@ impl std::fmt::Debug for FlowAccess {
 	}
 }
 impl FlowAccess {
+	#[cfg(feature = "gateway-mcp")]
+	pub(crate) fn restricts_untrusted_payloads(&self) -> bool {
+		self.policy.restrict_untrusted_payloads
+	}
 	pub fn recovery_binding(&self) -> Result<String, ProxyError> {
 		serde_json::to_string(&(&self.id, &self.binding, &self.policy))
 			.map(|v| crate::security::digest(&v))
@@ -38,26 +42,53 @@ impl FlowAccess {
 	pub fn current(&self) -> Result<(), ProxyError> {
 		self.classification().map(|_| ())
 	}
-	fn classification(&self) -> Result<DataClassification, ProxyError> {
+	pub async fn current_async(&self) -> Result<(), ProxyError> {
+		self.classification_async().await.map(|_| ())
+	}
+	pub(crate) async fn classification_async(&self) -> Result<DataClassification, ProxyError> {
+		self
+			.store
+			.clone()
+			.classification_async(self.id.clone(), (*self.binding).clone())
+			.await
+			.map_err(|_| ProxyError::AuthorizationFailed)
+	}
+	pub async fn check_async(
+		&self,
+		action: &ActionRequest,
+		destination: &str,
+	) -> Result<(), ProxyError> {
+		self.check_classification(self.classification_async().await?, action, destination)
+	}
+	pub(crate) fn classification(&self) -> Result<DataClassification, ProxyError> {
 		self
 			.store
 			.classification(&self.id, &self.binding)
 			.map_err(|_| ProxyError::AuthorizationFailed)
 	}
-	/// Candidate prefilter: reads live classification without minting a decision or credential.
-	pub fn permits(&self, action: &ActionRequest, destination: &str) -> Result<bool, ProxyError> {
-		let class = self.classification()?;
-		Ok(
-			self
-				.policy
-				.destinations
-				.iter()
-				.filter(|p| p.classification <= class)
-				.all(|p| p.permits(action, destination)),
-		)
+	/// Necessary destination conditions for one selection pass. Never a dispatch grant.
+	pub fn permits_classification(
+		&self,
+		class: DataClassification,
+		action: &ActionRequest,
+		destination: &str,
+	) -> bool {
+		let class = self.policy.egress_classification(class);
+		self
+			.policy
+			.destinations
+			.iter()
+			.filter(|p| p.classification <= class)
+			.all(|p| p.permits(action, destination))
 	}
-	pub fn check(&self, action: &ActionRequest, destination: &str) -> Result<(), ProxyError> {
-		let class = self.classification()?;
+
+	fn check_classification(
+		&self,
+		class: DataClassification,
+		action: &ActionRequest,
+		destination: &str,
+	) -> Result<(), ProxyError> {
+		let class = self.policy.egress_classification(class);
 		// Intersection, not replacement: an elevated label can only reduce available exits.
 		let result: Result<(), ProxyError> = (|| {
 			for policy in self
@@ -141,7 +172,7 @@ fn store(policy: &CrossComponentConfig) -> Result<Arc<dyn SecurityContextStore>,
 		.context_store()
 		.map_err(|_| ProxyError::AuthorizationFailed)
 }
-fn resolve(
+fn resolve_unchecked(
 	id: &str,
 	owner: &VerifiedOwner,
 	config: &SecurityConfig,
@@ -165,9 +196,18 @@ fn resolve(
 		correlation: crate::security::digest(id),
 		id: id.into(),
 	};
+	Ok(access)
+}
+fn resolve(
+	id: &str,
+	owner: &VerifiedOwner,
+	config: &SecurityConfig,
+) -> Result<FlowAccess, ProxyError> {
+	let access = resolve_unchecked(id, owner, config)?;
 	access.current()?;
 	Ok(access)
 }
+
 #[cfg(feature = "gateway-rag")]
 fn issue_documents(
 	owner: VerifiedOwner,
@@ -204,7 +244,51 @@ fn issue_documents(
 		.map_err(|_| ProxyError::AuthorizationFailed)
 }
 
-pub(crate) fn prepare(
+#[cfg(feature = "gateway-rag")]
+async fn issue_documents_async(
+	owner: VerifiedOwner,
+	config: &SecurityConfig,
+	classification: DataClassification,
+	parent: Option<&str>,
+	documents: Vec<security_types::DocumentVersion>,
+) -> Result<String, ProxyError> {
+	if let Some(id) = parent {
+		let access = resolve_unchecked(id, &owner, config)?;
+		access.current_async().await?;
+		access
+			.store
+			.elevate_documents_async(
+				id.into(),
+				(*access.binding).clone(),
+				classification,
+				documents,
+			)
+			.await
+			.map_err(|_| ProxyError::AuthorizationFailed)?;
+		return Ok(id.into()); // No renewal, downgrade, or new weaker copy.
+	}
+	let fingerprint = fingerprint(config)?;
+	let policy = config
+		.cross_component
+		.as_ref()
+		.ok_or(ProxyError::AuthorizationFailed)?;
+	store(policy)?
+		.issue_documents_async(
+			ContextBinding {
+				owner,
+				namespace: policy.namespace.clone(),
+				fingerprint,
+			},
+			policy.ttl_seconds,
+			policy.max_contexts,
+			classification,
+			documents,
+		)
+		.await
+		.map_err(|_| ProxyError::AuthorizationFailed)
+}
+
+fn prepare_unchecked(
 	config: &SecurityConfig,
 	headers: &http::HeaderMap,
 	extensions: &http::Extensions,
@@ -216,27 +300,65 @@ pub(crate) fn prepare(
 		let id = context_id(headers)?
 			.or_else(|| extensions.get::<FlowAccess>().map(|f| f.id.as_str()))
 			.ok_or(ProxyError::AuthorizationFailed)?;
-		resolve(id, &owner(extensions)?, config)
+		resolve_unchecked(id, &owner(extensions)?, config)
 	})();
-	if result.is_err() {
-		tracing::warn!(
-			"cross-component context missing, expired, foreign, or configuration-mismatched"
-		);
-		let mut extensions = extensions.clone();
-		let mut action = security_pipeline::context_assemble_for_identity(
-			crate::security::request_id(&mut extensions),
-			crate::security::identity_from_extensions(&extensions),
-			config
-				.cross_component
-				.as_ref()
-				.expect("enabled")
-				.namespace
-				.clone(),
-		);
-		action.action.name = "context/use".into();
-		audit_context(&action, false, "cross-component:invalid-context".into());
-	}
 	result.map(Some)
+}
+fn audit_invalid_context(config: &SecurityConfig, extensions: &http::Extensions) {
+	tracing::warn!("cross-component context missing, expired, foreign, or configuration-mismatched");
+	let mut extensions = extensions.clone();
+	let mut action = security_pipeline::context_assemble_for_identity(
+		crate::security::request_id(&mut extensions),
+		crate::security::identity_from_extensions(&extensions),
+		config
+			.cross_component
+			.as_ref()
+			.expect("enabled")
+			.namespace
+			.clone(),
+	);
+	action.action.name = "context/use".into();
+	audit_context(&action, false, "cross-component:invalid-context".into());
+}
+
+pub(crate) fn prepare(
+	config: &SecurityConfig,
+	headers: &http::HeaderMap,
+	extensions: &http::Extensions,
+) -> Result<Option<FlowAccess>, ProxyError> {
+	let result = prepare_unchecked(config, headers, extensions).and_then(|flow| {
+		if let Some(flow) = &flow {
+			flow.current()?;
+		}
+		Ok(flow)
+	});
+	if result.is_err() {
+		audit_invalid_context(config, extensions);
+	}
+	result
+}
+
+pub(crate) async fn prepare_async(
+	config: &SecurityConfig,
+	headers: &http::HeaderMap,
+	extensions: &http::Extensions,
+) -> Result<Option<FlowAccess>, ProxyError> {
+	let result = async {
+		let flow = prepare_unchecked(config, headers, extensions)?;
+		if let Some(flow) = &flow {
+			flow.current_async().await?;
+		}
+		// A storage wait must not extend the verified credential's lifetime.
+		if flow.is_some() {
+			owner(extensions)?;
+		}
+		Ok(flow)
+	}
+	.await;
+	if result.is_err() {
+		audit_invalid_context(config, extensions);
+	}
+	result
 }
 
 #[cfg(feature = "gateway-rag")]
@@ -277,6 +399,24 @@ impl RagIssuer {
 		action.resource.resource_type = security_types::ResourceType::SecurityContext;
 		Ok(action)
 	}
+	fn audit_issue(
+		&self,
+		context: &security_rag::GuardedContext,
+		result: Result<String, String>,
+	) -> Result<String, String> {
+		let action = security_pipeline::context_assemble_for_identity(
+			self.request_id.clone(),
+			self.owner.identity(),
+			context.corpus_id.clone(),
+		);
+		let rule = match &result {
+			Ok(id) => format!("cross-component:issue:{}", crate::security::digest(id)),
+			Err(_) => "cross-component:issue-denied".into(),
+		};
+		audit_context(&action, result.is_ok(), rule);
+		result
+	}
+
 	fn revoke_authorized(
 		&self,
 		id: &str,
@@ -328,7 +468,54 @@ impl gateway_rag::http::ContextConstraintIssuer for RagIssuer {
 			crate::security::evaluate_async(&self.config, &action)
 				.await
 				.map_err(|_| "context revocation denied")?;
-			self.revoke_authorized(id, &action)
+			let policy = self
+				.config
+				.cross_component
+				.as_ref()
+				.ok_or("context controls unavailable")?;
+			let binding = ContextBinding {
+				owner: self.owner.clone(),
+				namespace: policy.namespace.clone(),
+				fingerprint: fingerprint(&self.config).map_err(|_| "invalid context configuration")?,
+			};
+			let result = match store(policy) {
+				Ok(store) => store
+					.revoke_async(id.into(), binding)
+					.await
+					.map_err(|_| ProxyError::AuthorizationFailed),
+				Err(error) => Err(error),
+			};
+			audit_context(
+				&action,
+				result.is_ok(),
+				format!("cross-component:revoke:{}", crate::security::digest(id)),
+			);
+			result.map_err(|_| "context revocation denied".into())
+		})
+	}
+
+	fn issue_async<'a>(
+		&'a self,
+		context: &'a security_rag::GuardedContext,
+		parent: Option<&'a str>,
+	) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>> {
+		Box::pin(async move {
+			let result = issue_documents_async(
+				self.owner.clone(),
+				&self.config,
+				context
+					.classification
+					.unwrap_or(DataClassification::Restricted),
+				parent,
+				context
+					.chunks
+					.iter()
+					.filter_map(security_rag::lifecycle::document_reference)
+					.collect(),
+			)
+			.await
+			.map_err(|_| "cross-component context issuance denied".to_string());
+			self.audit_issue(context, result)
 		})
 	}
 
@@ -351,17 +538,7 @@ impl gateway_rag::http::ContextConstraintIssuer for RagIssuer {
 				.collect(),
 		)
 		.map_err(|_| "cross-component context issuance denied".to_string());
-		let action = security_pipeline::context_assemble_for_identity(
-			self.request_id.clone(),
-			self.owner.identity(),
-			context.corpus_id.clone(),
-		);
-		let rule = match &result {
-			Ok(id) => format!("cross-component:issue:{}", crate::security::digest(id)),
-			Err(_) => "cross-component:issue-denied".into(),
-		};
-		audit_context(&action, result.is_ok(), rule);
-		result
+		self.audit_issue(context, result)
 	}
 }
 

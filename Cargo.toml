@@ -1,4 +1,5 @@
 [patch.crates-io]
+regex-cache = { path = "crates/third-party/regex-cache" }
 schemars = { git = "https://github.com/howardjohn/schemars", rev = "f3e45a59786debf49e67d6bd6d8dcffc004d39ff" }
 http-serde = { git = "https://gitlab.com/howardjohn/http-serde", rev = "c2e482be0ddf029895ba72ef8749b9f94b388fc7" }
 rmcp = { git = "https://github.com/howardjohn/rust-sdk", rev = "7366ffc42beb89f27410ae348a67001beb4c6ba5" }
@@ -28,6 +29,7 @@ members = [
     "crates/gateway/runtime",
     "crates/gateway/app",
     # Platform and developer tooling
+    "crates/third-party/regex-cache",
     "crates/third-party/cel-fork/cel",
     "crates/third-party/cel-fork/cel-derive",
     "crates/platform/celx",

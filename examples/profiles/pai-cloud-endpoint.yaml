@@ -1,0 +1,93 @@
+# Cloud inference with local identity, authorization, PII, budgets and durable audit.
+# API_KEY is supplied by the operator; never put the actual key in this file.
+# EDGE_STATE_DIR must be an absolute private directory containing audit/, security-state/
+# and jwks.json. See docs/examples/tool-agent-poc.md for preparation.
+config:
+  management: {mode: edge}
+  bindAddress: 127.0.0.1
+  enableIpv6: false
+  adminAddr: off
+  statsAddr: off
+  readinessAddr: off
+  workerThreads: 2
+  securityAudit:
+    directory: ${EDGE_STATE_DIR}/audit
+  dependencyEgress:
+    destinations: {}
+
+aiSystems:
+  - name: pai-cloud
+    security:
+      mode: enforce
+      requiredIdentity: {user: true, agent: true, tenant: true}
+      agentIdentity:
+        required: true
+        agents:
+          - agentId: local-orchestrator
+            tenantId: device-local
+            clientIds: [local-assistant]
+            enabled: true
+      policies:
+        - id: pai-model
+          actionType: modelInvoke
+          resourceType: model
+          resourceId: qwen3.8-max
+          tenantId: device-local
+          agentId: local-orchestrator
+          effect: allow
+          enabled: true
+        - id: execution-create
+          actionType: executionOperation
+          actionName: execution/create
+          resourceType: execution
+          resourceId: pai-cloud
+          tenantId: device-local
+          agentId: local-orchestrator
+          effect: allow
+          enabled: true
+        - id: execution-cancel
+          actionType: executionOperation
+          actionName: execution/cancel
+          resourceType: execution
+          resourceId: pai-cloud
+          tenantId: device-local
+          agentId: local-orchestrator
+          effect: allow
+          enabled: true
+      pii: {enabled: true, mode: enforce, backend: native}
+      requiredAudit:
+        actionTypes: [modelInvoke, executionOperation]
+      dataEgress:
+        classification: internal
+        modelDestinations: ["cn-beijing.pai-token.aliyuncs.com:443"]
+      dependencyEgress:
+        destinations: {}
+      executionBudget:
+        namespace: pai-cloud
+        maxDurationSeconds: 120
+        maxContexts: 64
+        maxContextsPerOwner: 4
+        maxModelCalls: 4
+        maxToolCalls: 0
+        maxAgentCalls: 0
+        maxAttempts: 8
+        maxConcurrent: 2
+        storage:
+          type: journal
+          path: ${EDGE_STATE_DIR}/security-state/pai-executions.jsonl
+          maxBytes: 16777216
+    llm:
+      port: 18080
+      models:
+        - name: qwen3.8-max
+          provider: openAI
+          params:
+            baseUrl: https://cn-beijing.pai-token.aliyuncs.com/v1
+            apiKey: ${API_KEY}
+      policies:
+        jwtAuth:
+          mode: strict
+          issuer: https://edge.invalid
+          audiences: [edge-local]
+          jwks:
+            file: ${EDGE_STATE_DIR}/jwks.json

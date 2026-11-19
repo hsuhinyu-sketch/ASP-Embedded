@@ -80,8 +80,10 @@ impl StreamableHttpService {
 				.await
 			},
 			// if we're not in stateful mode, we don't support GET or DELETE because there is no session
-			(http::Method::GET, true) => self.handle_get(request, inputs).await,
-			(http::Method::DELETE, true) => self.handle_delete(request, inputs).await,
+			(http::Method::GET, true) if !inputs.restricted_payloads() => {
+				Box::pin(self.handle_get(request, inputs)).await
+			},
+			(http::Method::DELETE, true) => Box::pin(self.handle_delete(request, inputs)).await,
 			_ => Err(ProxyError::MCP(mcp::Error::MethodNotAllowed)),
 		}
 	}
@@ -128,6 +130,24 @@ impl StreamableHttpService {
 		let request_id = gateway_mcp::protocol::request_id(&message);
 		let protocol = request_protocol(&part.headers, &message, request_id.clone())?;
 		validate_standard_headers(&part.headers, &message, &protocol)?;
+		if inputs.restricted_payloads() {
+			let permitted = match &message {
+				ClientJsonRpcMessage::Request(r) => matches!(
+					r.request.method(),
+					"initialize" | "ping" | "tools/list" | "tools/call"
+				),
+				ClientJsonRpcMessage::Notification(n) => {
+					matches!(
+						n.notification,
+						ClientNotification::InitializedNotification(_)
+					)
+				},
+				_ => false,
+			};
+			if !permitted {
+				return Err(ProxyError::AuthorizationFailed);
+			}
+		}
 		part.extensions.insert(protocol.clone());
 		let header_session = part
 			.headers

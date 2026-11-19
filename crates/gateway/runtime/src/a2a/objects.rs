@@ -264,7 +264,7 @@ pub(crate) async fn authorize_request(
 		action,
 		rpc_id: rpc.id.clone(),
 	};
-	call.prepare_push(req, &rpc)?;
+	call.prepare_push(req, &rpc).await?;
 	Ok(call)
 }
 
@@ -274,9 +274,9 @@ impl AuthorizedCall {
 		response: &mut Response,
 	) -> Result<(), ProxyError> {
 		if self.streaming {
-			return self.apply_stream(response);
+			return self.apply_stream(response).await;
 		}
-		self.check_credential().map_err(|e| deny(&self.action, e))?;
+		self.check_continuation().await?;
 		// Non-stream RPCs cannot silently switch to opaque/SSE content.
 		if !matches!(
 			crate::http::classify_content_type(response.headers()),
@@ -318,6 +318,7 @@ impl AuthorizedCall {
 		if bytes.len() > limit {
 			return Err(deny(&self.action, ObjectError::DownloadLimit));
 		}
+		self.check_continuation().await?;
 		*response.body_mut() = Body::from(bytes);
 		Ok(())
 	}

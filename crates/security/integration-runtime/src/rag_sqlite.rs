@@ -1,9 +1,10 @@
 //! Optional transactional Context + document state. Async embedding API; no execution grants.
 //! A file belongs to one deployment namespace. JSONL is never imported or overwritten here.
 mod files;
+pub mod migration;
+mod ports;
 use crate::context_store::{
-	ContextBinding, ContextError, Snapshot, validate_binding, validate_namespace,
-	validate_references, validate_snapshot,
+	ContextBinding, ContextError, Snapshot, validate_binding, validate_references, validate_snapshot,
 };
 use files::Files;
 use security_rag::{
@@ -17,39 +18,13 @@ use sqlx::{
 };
 use std::{
 	collections::HashMap,
-	path::PathBuf,
 	time::{Duration, Instant},
 };
 
 const APPLICATION: i64 = 0x41535052;
 const WAL_RECLAIM_BYTES: u64 = 1_048_576;
 
-/// Explicit Rust configuration until Host selection and JSONL migration are implemented.
-/// max_database_bytes limits database pages, not total disk usage. WAL reclamation is separate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SqliteRagConfig {
-	pub path: PathBuf,
-	pub namespace: String,
-	pub max_documents: usize,
-	pub max_contexts: usize,
-	pub max_database_bytes: u64,
-	pub busy_timeout_millis: u64,
-}
-impl SqliteRagConfig {
-	pub fn validate(&self) -> Result<(), String> {
-		validate_namespace(&self.namespace)?;
-		if !self.path.is_absolute()
-			|| self.path.file_name().is_none()
-			|| !(1..=4096).contains(&self.max_documents)
-			|| !(1..=16384).contains(&self.max_contexts)
-			|| !(1_048_576..=67_108_864).contains(&self.max_database_bytes)
-			|| !(1..=5000).contains(&self.busy_timeout_millis)
-		{
-			return Err("invalid SQLite RAG path/capacity/busy timeout".into());
-		}
-		Ok(())
-	}
-}
+pub use crate::rag_storage::SqliteRagConfig;
 pub struct SqliteRagStore {
 	config: SqliteRagConfig,
 	authority: String,
@@ -68,15 +43,66 @@ fn denied<E>(_: E) -> ContextError {
 	ContextError::Denied
 }
 impl SqliteRagStore {
+	/// Reuse a live authority across listener generations and matching RAG/LLM declarations.
+	/// Different declarations on an owned file are refused; no second writer or hidden fallback.
+	pub async fn open_shared(mut config: SqliteRagConfig) -> Result<std::sync::Arc<Self>, String> {
+		use std::sync::{Arc, OnceLock, Weak};
+		type Stores = tokio::sync::Mutex<HashMap<std::path::PathBuf, Weak<SqliteRagStore>>>;
+		static STORES: OnceLock<Stores> = OnceLock::new();
+		config.validate()?;
+		let path = config.path.clone();
+		config.path = tokio::task::spawn_blocking(move || {
+			Ok::<_, String>(
+				path
+					.parent()
+					.ok_or("missing SQLite directory")?
+					.canonicalize()
+					.map_err(|_| "SQLite directory unavailable")?
+					.join(path.file_name().ok_or("missing SQLite filename")?),
+			)
+		})
+		.await
+		.map_err(|_| "SQLite path preparation unavailable")??;
+		let mut stores = STORES.get_or_init(Default::default).lock().await;
+		stores.retain(|_, store| store.strong_count() > 0);
+		if let Some(store) = stores.get(&config.path).and_then(Weak::upgrade) {
+			if store.config != config {
+				return Err("RAG SQLite file already open with another declaration".into());
+			}
+			// Opening a new generation must not revive a quarantined authority.
+			let mut db = store.db.lock().await;
+			let result = async {
+				let tx = db.begin().await?;
+				let committed = commit(tx).await;
+				db.after_commit(committed).await
+			}
+			.await;
+			db.complete(result)
+				.map_err(|_| "RAG SQLite authority unavailable")?;
+			drop(db);
+			return Ok(store);
+		}
+		let store = Arc::new(Self::open(config.clone()).await?);
+		stores.insert(config.path, Arc::downgrade(&store));
+		Ok(store)
+	}
 	pub fn authority_id(&self) -> &str {
 		&self.authority
 	}
 	pub async fn open(config: SqliteRagConfig) -> Result<Self, String> {
+		Self::open_inner(config, false).await
+	}
+	async fn open_inner(config: SqliteRagConfig, require_new: bool) -> Result<Self, String> {
 		config.validate()?;
 		let path = config.path.clone();
 		let files = tokio::task::spawn_blocking(move || Files::open(&path))
 			.await
 			.map_err(|_| "SQLite file preparation unavailable")??;
+		if require_new && !files.fresh {
+			return Err(
+				"migration requires a new SQLite destination; existing state is never overwritten".into(),
+			);
+		}
 		let options = SqliteConnectOptions::new()
 			.filename(&files.path)
 			.create_if_missing(false)
@@ -396,6 +422,38 @@ impl SqliteRagStore {
 			db.live(id)?;
 			check_expiry(expiry)?;
 			Ok(snapshot.classification)
+		}
+		.await;
+		db.complete(result)
+	}
+	/// Final assembly check when no Context has been issued yet. Context uses validate documents
+	/// in its own transaction instead, so this method is never a separate Context checkpoint.
+	pub async fn validate_documents(
+		&self,
+		subject: &Subject,
+		documents: &[DocumentVersion],
+	) -> Result<(), ContextError> {
+		validate_references(documents)?;
+		let mut db = self.db.lock().await;
+		let result = async {
+			let mut tx = db.begin().await?;
+			let mut expiry = None;
+			for reference in documents {
+				let meta = read_document(&mut tx, &reference.key)
+					.await?
+					.ok_or(ContextError::Denied)?;
+				meta.check_reference(subject, reference).map_err(denied)?;
+				if let Some(expires) = meta.access.expires_at {
+					expiry = Some(
+						expiry.map_or(expires, |old: chrono::DateTime<chrono::Utc>| {
+							old.min(expires)
+						}),
+					);
+				}
+			}
+			let committed = commit(tx).await;
+			db.after_commit(committed).await?;
+			check_expiry(expiry)
 		}
 		.await;
 		db.complete(result)

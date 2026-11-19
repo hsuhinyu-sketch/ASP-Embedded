@@ -52,6 +52,10 @@ dependencies = [
  "mimalloc",
  "platform-core",
  "pprof-alloc",
+ "security-audit",
+ "security-integration-runtime",
+ "serde_json",
+ "serde_yaml",
  "tikv-jemallocator",
  "tokio",
  "tracing",
@@ -5710,8 +5714,6 @@ dependencies = [
 [[package]]
 name = "regex-cache"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f7b62d69743b8b94f353b6b7c3deb4c5582828328bcb8d5fedf214373808793"
 dependencies = [
  "lru-cache",
  "oncemutex",
@@ -6179,6 +6181,8 @@ dependencies = [
 name = "security-integration-runtime"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "base64 0.22.1",
  "chrono",
  "libc",
  "reqwest",

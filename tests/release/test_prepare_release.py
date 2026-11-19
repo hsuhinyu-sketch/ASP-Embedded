@@ -55,7 +55,11 @@ class ReleaseTests(unittest.TestCase):
                 files = [entry for entry in stream.getmembers() if entry.isfile()]
                 self.assertEqual({Path(entry.name).name for entry in files},
                                  {"ai-security-platform", "LICENSE", "Cargo.lock", "RELEASE.md",
-                                  "LICENSE-platform-pool", "manifest.json"})
+                                  "LICENSE-platform-pool", "LICENSE-regex-cache", "manifest.json"})
+                cache_license = next(entry for entry in files
+                                     if entry.name.endswith("/LICENSE-regex-cache"))
+                self.assertEqual(stream.extractfile(cache_license).read(),
+                                 (ROOT / "crates/third-party/regex-cache/LICENSE").read_bytes())
                 manifest_member = next(entry for entry in files if entry.name.endswith("/manifest.json"))
                 manifest = json.load(stream.extractfile(manifest_member))
                 for entry in files:

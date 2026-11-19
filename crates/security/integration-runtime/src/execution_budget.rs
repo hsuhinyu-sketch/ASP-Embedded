@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 pub mod durable;
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -244,11 +246,81 @@ pub trait ExecutionBudgetStore: Send + Sync {
 }
 
 #[derive(Default)]
-pub struct InMemoryExecutionBudgetStore(
-	Mutex<HashMap<String, Arc<Record>>>,
-	Arc<AtomicUsize>,
-	Arc<AtomicUsize>,
-);
+pub struct InMemoryExecutionBudgetStore(Mutex<BudgetRecords>, Arc<AtomicUsize>, Arc<AtomicUsize>);
+
+#[derive(Default)]
+struct NamespaceCounts {
+	total: usize,
+	owners: HashMap<VerifiedOwner, usize>,
+}
+
+#[derive(Default)]
+struct BudgetRecords {
+	records: HashMap<String, Arc<Record>>,
+	counts: HashMap<String, NamespaceCounts>,
+	// A lower bound, never an authorization deadline. In-flight expired records keep it due.
+	next_reap: Option<Instant>,
+}
+impl BudgetRecords {
+	fn insert(&mut self, record: Arc<Record>) {
+		if let Some(previous) = self.records.insert(record.id.clone(), record.clone()) {
+			Self::remove_count(&mut self.counts, &previous);
+		}
+		if !self.counts.contains_key(&record.config.namespace) {
+			self
+				.counts
+				.insert(record.config.namespace.clone(), NamespaceCounts::default());
+		}
+		let counts = self
+			.counts
+			.get_mut(&record.config.namespace)
+			.expect("indexed namespace");
+		counts.total += 1;
+		if let Some(count) = counts.owners.get_mut(&record.owner) {
+			*count += 1;
+		} else {
+			counts.owners.insert(record.owner.clone(), 1);
+		}
+		let until = record.cleanup_deadline().unwrap_or(record.deadline);
+		self.next_reap = Some(self.next_reap.map_or(until, |old| old.min(until)));
+	}
+	fn remove_count(counts: &mut HashMap<String, NamespaceCounts>, record: &Record) {
+		let namespace = counts
+			.get_mut(&record.config.namespace)
+			.expect("indexed namespace");
+		namespace.total -= 1;
+		let owner = namespace
+			.owners
+			.get_mut(&record.owner)
+			.expect("indexed owner");
+		*owner -= 1;
+		if *owner == 0 {
+			namespace.owners.remove(&record.owner);
+		}
+		if namespace.total == 0 {
+			counts.remove(&record.config.namespace);
+		}
+	}
+	fn reap(&mut self, now: Instant) {
+		if self.next_reap.is_none_or(|until| until > now) {
+			return;
+		}
+		self.next_reap = None;
+		self.records.retain(|_, record| {
+			let until = record.cleanup_deadline().unwrap_or(record.deadline);
+			// Do not reset exhausted/cancelled records early or evict in-flight cleanup.
+			let keep = until > now
+				|| record.usage.lock().map_or(true, |u| u.concurrent != 0)
+				|| record.cleanup.as_ref().is_some_and(|c| c.active());
+			if keep {
+				self.next_reap = Some(self.next_reap.map_or(until, |old| old.min(until)));
+			} else {
+				Self::remove_count(&mut self.counts, record);
+			}
+			keep
+		});
+	}
+}
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Invocation {
 	target: String,
@@ -539,21 +611,13 @@ impl ExecutionBudgetStore for InMemoryExecutionBudgetStore {
 		config.validate().map_err(|_| BudgetError::InvalidContext)?;
 		let mut records = self.0.lock().map_err(|_| BudgetError::Unavailable)?;
 		let now = Instant::now();
-		// Do not evict live or in-flight records, nor reset exhausted records early.
-		records.retain(|_, r| {
-			r.deadline > now
-				|| r.cleanup_deadline().is_ok_and(|until| until > now)
-				|| r.usage.lock().map_or(true, |u| u.concurrent != 0)
-				|| r.cleanup.as_ref().is_some_and(|c| c.active())
-		});
-		let domain = records
-			.values()
-			.filter(|r| r.config.namespace == config.namespace)
-			.collect::<Vec<_>>();
-		if records.len() >= 16384
-			|| domain.len() >= config.max_contexts
-			|| domain.iter().filter(|r| r.owner == owner).count() >= config.max_contexts_per_owner
-		{
+		records.reap(now);
+		let counts = records.counts.get(&config.namespace);
+		if records.records.len() >= 16384
+			|| counts.is_some_and(|c| c.total >= config.max_contexts)
+			|| counts.is_some_and(|c| {
+				c.owners.get(&owner).copied().unwrap_or(0) >= config.max_contexts_per_owner
+			}) {
 			return Err(BudgetError::Capacity);
 		}
 		let mut detached_config = config.clone();
@@ -575,7 +639,7 @@ impl ExecutionBudgetStore for InMemoryExecutionBudgetStore {
 			deadline: now + Duration::from_secs(config.max_duration_seconds),
 			usage: Default::default(),
 		});
-		records.insert(record.id.clone(), record.clone());
+		records.insert(record.clone());
 		Ok(record)
 	}
 	fn resolve(
@@ -597,7 +661,7 @@ impl ExecutionBudgetStore for InMemoryExecutionBudgetStore {
 		fingerprint: &str,
 	) -> Result<ExecutionHandle, BudgetError> {
 		let records = self.0.lock().map_err(|_| BudgetError::Unavailable)?;
-		let record = records.get(id).ok_or(BudgetError::InvalidContext)?;
+		let record = records.records.get(id).ok_or(BudgetError::InvalidContext)?;
 		if &record.owner != owner
 			|| record.config.namespace != config.namespace
 			|| record.fingerprint != fingerprint

@@ -12,16 +12,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AuthorizedContext, DataClassification, KnowledgeChunk};
 
-fn default_indirect_instruction_patterns() -> Vec<String> {
-	vec![
-		"ignore previous instructions".into(),
-		"ignore all previous instructions".into(),
-		"disregard previous instructions".into(),
-		"system message".into(),
-		"developer message".into(),
-		"do not follow the previous".into(),
-	]
-}
+const DEFAULT_INDIRECT_INSTRUCTIONS: [&str; 6] = [
+	"ignore previous instructions",
+	"ignore all previous instructions",
+	"disregard previous instructions",
+	"system message",
+	"developer message",
+	"do not follow the previous",
+];
 
 /// Whether an indirect-injection finding removes a Chunk or is reported while preserving content.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -34,30 +32,46 @@ pub enum ContextGuardMode {
 	Shadow,
 }
 
+/// Selects the built-in indirect-instruction signals when no custom patterns are configured.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextGuardRuleSet {
+	#[default]
+	Legacy,
+	Contextual,
+}
+
+impl ContextGuardRuleSet {
+	fn is_legacy(&self) -> bool {
+		*self == Self::Legacy
+	}
+}
+
 /// Context-level controls are intentionally separate from retrieval ACLs: content may be allowed
 /// to read but still unsafe to present as model instructions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextGuardConfig {
 	#[serde(default)]
 	pub mode: ContextGuardMode,
-	/// Case-insensitive phrases that identify untrusted instructions embedded in retrieved content.
-	/// This is a deterministic PoC signal; production can add a classifier behind the same brick.
-	#[serde(default = "default_indirect_instruction_patterns")]
-	pub indirect_instruction_patterns: Vec<String>,
+	#[serde(default, skip_serializing_if = "ContextGuardRuleSet::is_legacy")]
+	pub rule_set: ContextGuardRuleSet,
+	/// A supplied list replaces the built-in rules with case-insensitive literal matching.
+	#[serde(
+		default,
+		deserialize_with = "deserialize_instruction_patterns",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub indirect_instruction_patterns: Option<Vec<String>>,
 	/// Chunks with these labels retain their provenance but have content replaced before assembly.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub redact_labels: Vec<String>,
 }
 
-impl Default for ContextGuardConfig {
-	fn default() -> Self {
-		Self {
-			mode: ContextGuardMode::Enforce,
-			indirect_instruction_patterns: default_indirect_instruction_patterns(),
-			redact_labels: Vec::new(),
-		}
-	}
+fn deserialize_instruction_patterns<'de, D: serde::Deserializer<'de>>(
+	deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+	Vec::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,21 +171,40 @@ pub enum ContextAssemblyError {
 
 /// A deterministic, configurable guard for context that has already passed retrieval ACL checks.
 pub struct ContextGuard {
-	config: ContextGuardConfig,
+	mode: ContextGuardMode,
+	instructions: InstructionRules,
+	redact_labels: Vec<String>,
+}
+
+enum InstructionRules {
+	Literal(Vec<String>),
+	Contextual,
 }
 
 impl ContextGuard {
 	pub fn new(config: ContextGuardConfig) -> Result<Self, ContextAssemblyError> {
-		if config
-			.indirect_instruction_patterns
-			.iter()
-			.any(|pattern| pattern.trim().is_empty())
-		{
-			return Err(ContextAssemblyError::InvalidConfig(
-				"indirectInstructionPatterns must not contain empty values".into(),
-			));
-		}
-		Ok(Self { config })
+		let instructions = match config.indirect_instruction_patterns {
+			Some(patterns) => {
+				if patterns.iter().any(|pattern| pattern.trim().is_empty()) {
+					return Err(ContextAssemblyError::InvalidConfig(
+						"indirectInstructionPatterns must not contain empty values".into(),
+					));
+				}
+				InstructionRules::Literal(
+					patterns
+						.iter()
+						.map(|pattern| pattern.to_lowercase())
+						.collect(),
+				)
+			},
+			None if config.rule_set == ContextGuardRuleSet::Contextual => InstructionRules::Contextual,
+			None => InstructionRules::Literal(DEFAULT_INDIRECT_INSTRUCTIONS.map(str::to_owned).into()),
+		};
+		Ok(Self {
+			mode: config.mode,
+			instructions,
+			redact_labels: config.redact_labels,
+		})
 	}
 
 	/// Authorizes the `ContextAssemble` action, then applies injection isolation and label redaction.
@@ -291,7 +324,7 @@ impl ContextGuard {
 					kind: ContextFindingKind::IndirectPromptInjection,
 					rule_id,
 				});
-				if self.config.mode == ContextGuardMode::Enforce {
+				if self.mode == ContextGuardMode::Enforce {
 					removed_chunk_ids.push(chunk.id);
 					continue;
 				}
@@ -323,22 +356,165 @@ impl ContextGuard {
 	}
 
 	fn indirect_instruction_rule(&self, content: &str) -> Option<String> {
-		let normalized = content.to_lowercase();
-		self
-			.config
-			.indirect_instruction_patterns
-			.iter()
-			.position(|pattern| normalized.contains(&pattern.to_lowercase()))
-			.map(|index| format!("indirect-instruction-{index}"))
+		let matched = match &self.instructions {
+			InstructionRules::Literal(patterns) if patterns.is_empty() => None,
+			InstructionRules::Literal(patterns) => {
+				let normalized = content.to_lowercase();
+				patterns
+					.iter()
+					.position(|pattern| normalized.contains(pattern))
+			},
+			InstructionRules::Contextual => {
+				let normalized = normalized_instruction_view(content);
+				DEFAULT_INDIRECT_INSTRUCTIONS.iter().position(|pattern| {
+					if matches!(*pattern, "system message" | "developer message") {
+						role_command(&normalized, pattern)
+					} else {
+						normalized.contains(pattern)
+					}
+				})
+			},
+		};
+		matched.map(|index| format!("indirect-instruction-{index}"))
 	}
 
 	fn has_redacted_label(&self, chunk: &KnowledgeChunk) -> bool {
 		chunk.labels.iter().any(|label| {
 			self
-				.config
 				.redact_labels
 				.iter()
 				.any(|redacted| label.eq_ignore_ascii_case(redacted))
 		})
+	}
+}
+
+/// Transform a single already bounded Chunk only for matching. Keep the originals for assembly.
+fn normalized_instruction_view(content: &str) -> String {
+	let mut view = String::with_capacity(content.len());
+	let mut space = false;
+	for ch in content.chars() {
+		if matches!(ch, '\u{00ad}' | '\u{200b}' | '\u{2060}' | '\u{feff}') {
+			continue;
+		}
+		if ch.is_whitespace() {
+			space = !view.is_empty();
+		} else {
+			if space {
+				view.push(' ');
+				space = false;
+			}
+			view.extend(ch.to_lowercase());
+		}
+	}
+	view
+}
+
+fn role_command(text: &str, role: &str) -> bool {
+	const SEPARATORS: [char; 7] = [' ', ':', ']', '>', '\'', '"', '`'];
+	text.match_indices(role).any(|(start, role)| {
+		if text[..start].ends_with(|ch: char| ch.is_alphanumeric() || ch == '_') {
+			return false;
+		}
+		let tail = &text[start + role.len()..];
+		let Some(command) = tail.strip_prefix(SEPARATORS) else {
+			return false;
+		};
+		matches!(
+			command
+				.trim_start_matches(SEPARATORS)
+				.split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+				.next(),
+			Some(
+				"call"
+					| "invoke"
+					| "execute"
+					| "run"
+					| "ignore"
+					| "disregard"
+					| "override"
+					| "obey"
+					| "reveal"
+					| "send"
+			)
+		)
+	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn explicit_patterns_keep_their_literal_behavior() {
+		let config = serde_json::from_value(serde_json::json!({
+			"ruleSet": "contextual", "indirectInstructionPatterns": ["system message"]
+		}))
+		.unwrap();
+		let guard = ContextGuard::new(config).unwrap();
+		assert!(
+			guard
+				.indirect_instruction_rule("The SYSTEM MESSAGE field")
+				.is_some()
+		);
+		assert!(guard.indirect_instruction_rule("system\nmessage").is_none());
+		assert!(
+			guard
+				.indirect_instruction_rule("ignore previous instructions")
+				.is_none()
+		);
+		let config = serde_json::from_value(serde_json::json!({
+			"ruleSet": "contextual", "indirectInstructionPatterns": []
+		}))
+		.unwrap();
+		let guard = ContextGuard::new(config).unwrap();
+		assert!(
+			guard
+				.indirect_instruction_rule("ignore previous instructions")
+				.is_none()
+		);
+		for invalid in ["null", r#"[" \t"]"#] {
+			let wire = format!("{{\"indirectInstructionPatterns\":{invalid}}}");
+			assert!(
+				serde_json::from_str::<ContextGuardConfig>(&wire)
+					.ok()
+					.and_then(|config| ContextGuard::new(config).ok())
+					.is_none()
+			);
+		}
+	}
+
+	#[test]
+	fn normalized_matches_preserve_shadow_text_and_provenance() {
+		let chunk: KnowledgeChunk = serde_json::from_value(serde_json::json!({
+			"id":"chunk", "documentId":"doc", "corpusId":"docs", "tenantId":"tenant-a",
+			"content":"DISREGARD\u{2060}\u{00a0}previous\n instructions.", "sourceHash":"hash", "tokenCount":5,
+			"classification":"restricted", "classificationSource":"fixture"
+		}))
+		.unwrap();
+		let context = AuthorizedContext {
+			corpus_id: "docs".into(),
+			query_hash: "query-hash".into(),
+			chunks: vec![chunk.clone()],
+			context_tokens: 5,
+			rejected: vec![],
+		};
+		let mut config = ContextGuardConfig {
+			mode: ContextGuardMode::Shadow,
+			rule_set: ContextGuardRuleSet::Contextual,
+			..Default::default()
+		};
+		let shadow = ContextGuard::new(config.clone())
+			.unwrap()
+			.inspect(context.clone());
+		assert_eq!(shadow.chunks, [chunk]);
+		assert_eq!(shadow.context_tokens, 5);
+		assert_eq!(shadow.classification, Some(DataClassification::Restricted));
+		assert_eq!(shadow.findings[0].rule_id, "indirect-instruction-2");
+		config.mode = ContextGuardMode::Enforce;
+		let enforced = ContextGuard::new(config).unwrap().inspect(context);
+		assert_eq!(enforced.removed_chunk_ids, ["chunk"]);
+		assert!(enforced.chunks.is_empty());
+		assert_eq!(enforced.context_tokens, 0);
+		assert_eq!(enforced.findings, shadow.findings);
 	}
 }

@@ -1,7 +1,7 @@
 use super::*;
 
-#[test]
-fn sampling_negotiation_matches_compiled_model_execution() {
+#[tokio::test]
+async fn sampling_negotiation_matches_compiled_model_execution() {
 	let (access, parent) = setup();
 	let config =
 		serde_json::from_value(json!({"samplingModels":["local"],"roots":["file:///workspace"]}))
@@ -16,7 +16,7 @@ fn sampling_negotiation_matches_compiled_model_execution() {
 	assert!(value.get("roots").is_some());
 	if !cfg!(feature = "gateway-llm") {
 		let mut message = serde_json::from_value(json!({"jsonrpc":"2.0","id":9,"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"hello"}}],"maxTokens":8}})).unwrap();
-		assert!(request(&access, Some(&parent), &mut message).is_err());
+		assert!(request(&access, Some(&parent), &mut message).await.is_err());
 	}
 }
 
@@ -46,11 +46,11 @@ fn setup() -> (SessionAccess, ParentLease) {
 	.unwrap();
 	(access, parent)
 }
-fn question(access: &SessionAccess, parent: &ParentLease) -> String {
+async fn question(access: &SessionAccess, parent: &ParentLease) -> String {
 	let mut message =
 		serde_json::from_value(json!({"jsonrpc":"2.0","id":21,"method":"roots/list","params":{}}))
 			.unwrap();
-	request(access, Some(parent), &mut message).unwrap();
+	request(access, Some(parent), &mut message).await.unwrap();
 	serde_json::to_value(message).unwrap()["id"]
 		.as_str()
 		.unwrap()
@@ -60,19 +60,19 @@ fn answer(id: &str) -> ClientJsonRpcMessage {
 	serde_json::from_value(json!({"jsonrpc":"2.0","id":id,"result":{"roots":[{"uri":"file:///workspace"},{"uri":"file:///private"}]}})).unwrap()
 }
 
-#[test]
-fn reverse_response_is_single_use_and_bound_to_live_parent() {
+#[tokio::test]
+async fn reverse_response_is_single_use_and_bound_to_live_parent() {
 	let (access, parent) = setup();
-	let id = question(&access, &parent);
-	let (server, forwarded, _, _) = response(&access, answer(&id)).unwrap();
+	let id = question(&access, &parent).await;
+	let (server, forwarded, _, _) = response(&access, answer(&id)).await.unwrap();
 	assert_eq!(server, "tools");
 	let forwarded = serde_json::to_value(forwarded).unwrap();
 	assert_eq!(forwarded["id"], 21);
 	assert_eq!(forwarded["result"]["roots"].as_array().unwrap().len(), 1);
-	assert!(response(&access, answer(&id)).is_err());
-	let id = question(&access, &parent);
+	assert!(response(&access, answer(&id)).await.is_err());
+	let id = question(&access, &parent).await;
 	drop(parent);
-	assert!(response(&access, answer(&id)).is_err());
+	assert!(response(&access, answer(&id)).await.is_err());
 	assert!(
 		access
 			.binding
@@ -86,12 +86,12 @@ fn reverse_response_is_single_use_and_bound_to_live_parent() {
 	);
 }
 
-#[test]
-fn reverse_response_from_other_session_or_after_deadline_is_denied() {
+#[tokio::test]
+async fn reverse_response_from_other_session_or_after_deadline_is_denied() {
 	let (access, parent) = setup();
-	let id = question(&access, &parent);
+	let id = question(&access, &parent).await;
 	let (foreign, _parent) = setup();
-	assert!(response(&foreign, answer(&id)).is_err());
+	assert!(response(&foreign, answer(&id)).await.is_err());
 	access
 		.binding
 		.as_ref()
@@ -103,13 +103,13 @@ fn reverse_response_from_other_session_or_after_deadline_is_denied() {
 		.get_mut(&id)
 		.unwrap()
 		.expires = Instant::now() - Duration::from_secs(1);
-	assert!(response(&access, answer(&id)).is_err());
+	assert!(response(&access, answer(&id)).await.is_err());
 }
 
-#[test]
-fn legacy_parent_constraint_is_rechecked_before_reverse_response() {
+#[tokio::test]
+async fn legacy_parent_constraint_is_rechecked_before_reverse_response() {
 	let (mut access, parent) = setup();
-	let id = question(&access, &parent);
+	let id = question(&access, &parent).await;
 	let legacy: security_pipeline::SecurityPipelineConfig =
 		serde_json::from_value(json!({"policies":[
 				{"id":"allow","effect":"allow","enabled":true},
@@ -117,10 +117,10 @@ fn legacy_parent_constraint_is_rechecked_before_reverse_response() {
 		]}))
 		.unwrap();
 	access.legacy = Some(legacy.into());
-	assert!(response(&access, answer(&id)).is_err());
+	assert!(response(&access, answer(&id)).await.is_err());
 }
 
-fn task_setup() -> (SessionAccess, ParentLease) {
+async fn task_setup() -> (SessionAccess, ParentLease) {
 	let (mut access, ordinary) = setup();
 	drop(ordinary);
 	access.limits.reverse.as_mut().unwrap().max_pending = 1;
@@ -130,16 +130,21 @@ fn task_setup() -> (SessionAccess, ParentLease) {
 		"serverInfo":{"name":"tools","version":"1"},
 		"capabilities":{"tasks":{"requests":{"tools":{"call":{}}}}}}))
 	.unwrap();
-	super::super::tasks::observe_initialize(&access, "tools", &initialize).unwrap();
+	super::super::tasks::observe_initialize(&access, "tools", &initialize)
+		.await
+		.unwrap();
 	let mut tools = serde_json::from_value(json!({"tools":[{"name":"echo",
 		"inputSchema":{"type":"object"},"execution":{"taskSupport":"optional"}}]}))
 	.unwrap();
-	super::super::tasks::observe_tools(&access, "tools", &mut tools).unwrap();
+	super::super::tasks::observe_tools(&access, "tools", &mut tools)
+		.await
+		.unwrap();
 	let mut ctx = super::super::tests::context(&access);
 	let rpc = serde_json::from_value(json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
 		"params":{"name":"echo","arguments":{},"task":{"ttl":60000}}}))
 	.unwrap();
 	let admission = super::super::tasks::prepare(&rpc, &mut ctx, "tools", false)
+		.await
 		.unwrap()
 		.unwrap();
 	let ticket = ctx
@@ -151,19 +156,22 @@ fn task_setup() -> (SessionAccess, ParentLease) {
 	let mut result = serde_json::from_value(json!({"task":{"taskId":"upstream-task",
 		"status":"working","ttl":60000,"createdAt":now,"lastUpdatedAt":now}}))
 	.unwrap();
-	ticket.response(&access, &mut result).unwrap();
+	ticket.response(&access, &mut result).await.unwrap();
 	drop(admission);
 	let task_id = serde_json::to_value(result).unwrap()["task"]["taskId"].clone();
 	let mut rpc = serde_json::from_value(json!({"jsonrpc":"2.0","id":2,"method":"tasks/result",
 		"params":{"taskId":task_id}}))
 	.unwrap();
-	super::super::tasks::route(&mut rpc, &mut ctx).unwrap();
+	super::super::tasks::route(&mut rpc, &mut ctx)
+		.await
+		.unwrap();
 	let ticket = ctx
 		.extensions_mut()
 		.get::<super::super::tasks::Ticket>()
 		.unwrap()
 		.clone();
 	let parent = task_parent(&access, "tools", Some(&rpc), &ticket)
+		.await
 		.unwrap()
 		.unwrap();
 	(access, parent)
@@ -175,22 +183,22 @@ fn task_question(id: Value) -> ServerJsonRpcMessage {
 	.unwrap()
 }
 
-fn task_answer(access: &SessionAccess, parent: &ParentLease, question: ServerJsonRpcMessage) {
+async fn task_answer(access: &SessionAccess, parent: &ParentLease, question: ServerJsonRpcMessage) {
 	let id = serde_json::to_value(question).unwrap()["id"].clone();
 	let message = serde_json::from_value(json!({"jsonrpc":"2.0","id":id,"result":{
 		"roots":[{"uri":"file:///workspace"}],
 		"_meta":{"io.modelcontextprotocol/related-task":{"taskId":parent.parent.task.as_ref().unwrap().gateway_id()}}
 	}})).unwrap();
-	response(access, message).unwrap();
+	response(access, message).await.unwrap();
 }
 
-#[test]
-fn rejected_capacity_and_negotiation_do_not_consume_task_interaction_ids() {
+#[tokio::test]
+async fn rejected_capacity_and_negotiation_do_not_consume_task_interaction_ids() {
 	for reason in ["capacity", "negotiation"] {
-		let (access, parent) = task_setup();
+		let (access, parent) = task_setup().await;
 		let mut first = task_question(json!(0));
 		if reason == "capacity" {
-			request(&access, Some(&parent), &mut first).unwrap();
+			request(&access, Some(&parent), &mut first).await.unwrap();
 		} else {
 			access
 				.binding
@@ -204,11 +212,11 @@ fn rejected_capacity_and_negotiation_do_not_consume_task_interaction_ids() {
 		for id in 1..=64 {
 			let mut message = task_question(json!(id));
 			let original = serde_json::to_value(&message).unwrap();
-			assert!(request(&access, Some(&parent), &mut message).is_err());
+			assert!(request(&access, Some(&parent), &mut message).await.is_err());
 			assert_eq!(serde_json::to_value(message).unwrap(), original);
 		}
 		if reason == "capacity" {
-			task_answer(&access, &parent, first);
+			task_answer(&access, &parent, first).await;
 		} else {
 			access
 				.binding
@@ -220,23 +228,35 @@ fn rejected_capacity_and_negotiation_do_not_consume_task_interaction_ids() {
 				.capabilities = json!({"roots":{}});
 		}
 		let mut retry = task_question(json!(1));
-		request(&access, Some(&parent), &mut retry).unwrap();
-		task_answer(&access, &parent, retry);
+		request(&access, Some(&parent), &mut retry).await.unwrap();
+		task_answer(&access, &parent, retry).await;
 	}
 }
 
-#[test]
-fn duplicates_remain_single_use_and_the_task_lifetime_limit_is_preserved() {
-	let (access, parent) = task_setup();
+#[tokio::test]
+async fn duplicates_remain_single_use_and_the_task_lifetime_limit_is_preserved() {
+	let (access, parent) = task_setup().await;
 	for id in 0..64 {
 		let mut message = task_question(json!(id));
-		request(&access, Some(&parent), &mut message).unwrap();
+		request(&access, Some(&parent), &mut message).await.unwrap();
 		let mut duplicate = task_question(json!(id));
-		assert!(request(&access, Some(&parent), &mut duplicate).is_err());
-		task_answer(&access, &parent, message);
-		assert!(request(&access, Some(&parent), &mut duplicate).is_err());
+		assert!(
+			request(&access, Some(&parent), &mut duplicate)
+				.await
+				.is_err()
+		);
+		task_answer(&access, &parent, message).await;
+		assert!(
+			request(&access, Some(&parent), &mut duplicate)
+				.await
+				.is_err()
+		);
 	}
-	assert!(request(&access, Some(&parent), &mut task_question(json!(64))).is_err());
+	assert!(
+		request(&access, Some(&parent), &mut task_question(json!(64)))
+			.await
+			.is_err()
+	);
 	assert!(
 		access
 			.binding
@@ -250,10 +270,11 @@ fn duplicates_remain_single_use_and_the_task_lifetime_limit_is_preserved() {
 	);
 }
 
-#[test]
-fn concurrent_reverse_admission_reserves_only_available_pending_slots() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_reverse_admission_reserves_only_available_pending_slots() {
 	for same_id in [false, true] {
-		let (access, parent) = task_setup();
+		let (access, parent) = task_setup().await;
+		let runtime = tokio::runtime::Handle::current();
 		let results = std::thread::scope(|scope| {
 			let start = Arc::new(std::sync::Barrier::new(8));
 			let handles: Vec<_> = (0..8)
@@ -261,13 +282,15 @@ fn concurrent_reverse_admission_reserves_only_available_pending_slots() {
 					let access = access.clone();
 					let parent = &parent;
 					let start = start.clone();
+					let runtime = &runtime;
 					scope.spawn(move || {
 						let upstream = if same_id { 0 } else { id };
 						let mut message = task_question(json!(upstream));
 						start.wait();
 						(
 							upstream,
-							request(&access, Some(parent), &mut message)
+							runtime
+								.block_on(request(&access, Some(parent), &mut message))
 								.ok()
 								.map(|_| message),
 						)
@@ -298,22 +321,22 @@ fn concurrent_reverse_admission_reserves_only_available_pending_slots() {
 			.unwrap();
 		for (_, message) in &results {
 			if let Some(message) = message {
-				task_answer(&access, &parent, message.clone());
+				task_answer(&access, &parent, message.clone()).await;
 			}
 		}
 		for (id, _) in results {
 			if id != winner {
 				let mut retry = task_question(json!(id));
-				request(&access, Some(&parent), &mut retry).unwrap();
-				task_answer(&access, &parent, retry);
+				request(&access, Some(&parent), &mut retry).await.unwrap();
+				task_answer(&access, &parent, retry).await;
 			}
 		}
 	}
 }
 
-#[test]
-fn denied_and_invalid_requests_do_not_claim_task_ids() {
-	let (access, parent) = task_setup();
+#[tokio::test]
+async fn denied_and_invalid_requests_do_not_claim_task_ids() {
+	let (access, parent) = task_setup().await;
 	let mut denied = access.clone();
 	denied.legacy = Some(
 		serde_json::from_value::<security_pipeline::SecurityPipelineConfig>(json!({
@@ -323,16 +346,20 @@ fn denied_and_invalid_requests_do_not_claim_task_ids() {
 		.into(),
 	);
 	for id in 0..64 {
-		assert!(request(&denied, Some(&parent), &mut task_question(json!(id))).is_err());
+		assert!(
+			request(&denied, Some(&parent), &mut task_question(json!(id)))
+				.await
+				.is_err()
+		);
 		let mut invalid = task_question(json!(id));
 		if let ServerJsonRpcMessage::Request(r) = &mut invalid {
 			r.request = serde_json::from_value(json!({"method":"roots/list","params":{
 				"_meta":{"io.modelcontextprotocol/related-task":{"taskId":"foreign"}}}}))
 			.unwrap();
 		}
-		assert!(request(&access, Some(&parent), &mut invalid).is_err());
+		assert!(request(&access, Some(&parent), &mut invalid).await.is_err());
 	}
 	let mut message = task_question(json!(0));
-	request(&access, Some(&parent), &mut message).unwrap();
-	task_answer(&access, &parent, message);
+	request(&access, Some(&parent), &mut message).await.unwrap();
+	task_answer(&access, &parent, message).await;
 }

@@ -61,8 +61,8 @@ pub(super) fn context(access: &SessionAccess) -> super::super::upstream::Incomin
 #[tokio::test]
 async fn session_checks_intersect_common_and_legacy_declarations() {
 	let mut access = access();
-	assert!(access.check().is_ok());
-	assert!(access.check_async().await.is_ok());
+	assert!(access.check().await.is_ok());
+	assert!(access.check().await.is_ok());
 	for rules in [
 		json!([]),
 		json!([
@@ -73,25 +73,25 @@ async fn session_checks_intersect_common_and_legacy_declarations() {
 		let legacy: security_pipeline::SecurityPipelineConfig =
 			serde_json::from_value(json!({"policies":rules})).unwrap();
 		access.legacy = Some(legacy.into());
-		assert!(access.check().is_err());
-		assert!(access.check_async().await.is_err());
+		assert!(access.check().await.is_err());
+		assert!(access.check().await.is_err());
 	}
 	let legacy: security_pipeline::SecurityPipelineConfig = serde_json::from_value(json!({
 		"policies":[{"id":"allow","enabled":true,"effect":"allow"}]
 	}))
 	.unwrap();
 	access.legacy = Some(legacy.into());
-	assert!(access.check().is_ok());
-	assert!(access.check_async().await.is_ok());
+	assert!(access.check().await.is_ok());
+	assert!(access.check().await.is_ok());
 	Arc::make_mut(&mut access.config).pipeline.policies.clear();
-	assert!(access.check().is_err());
-	assert!(access.check_async().await.is_err());
+	assert!(access.check().await.is_err());
+	assert!(access.check().await.is_err());
 }
 
-#[test]
-fn session_rejects_foreign_owner_scope_expiry_and_closed_binding() {
+#[tokio::test]
+async fn session_rejects_foreign_owner_scope_expiry_and_closed_binding() {
 	let access = access();
-	assert!(access.check().is_ok());
+	assert!(access.check().await.is_ok());
 	for field in ["user", "tenant", "client", "issuer", "scope"] {
 		let mut foreign = access.clone();
 		let mut identity = foreign.identity.clone();
@@ -111,18 +111,18 @@ fn session_rejects_foreign_owner_scope_expiry_and_closed_binding() {
 			},
 		)
 		.unwrap();
-		assert!(foreign.check().is_err(), "{field}");
+		assert!(foreign.check().await.is_err(), "{field}");
 	}
 	let mut expired = access.clone();
 	expired.expires = chrono::Utc::now().timestamp() - 1;
-	assert!(expired.check().is_err());
+	assert!(expired.check().await.is_err());
 	access
 		.binding
 		.as_ref()
 		.unwrap()
 		.closed
 		.store(true, Ordering::Release);
-	assert!(access.check().is_err());
+	assert!(access.check().await.is_err());
 }
 
 #[tokio::test]
@@ -197,6 +197,7 @@ async fn notifications_do_not_lose_terminal_result_or_disclose_unrelated_progres
 			.map(|v| Ok(serde_json::from_value(v).unwrap())),
 	));
 	let values = protect_messages(stream, &context, Some(&request), "upstream")
+		.await
 		.try_collect::<Vec<_>>()
 		.await
 		.unwrap();
@@ -220,6 +221,7 @@ async fn ignored_notifications_do_not_extend_idle_deadline() {
 	let start = tokio::time::Instant::now();
 	assert!(
 		protect_messages(stream, &context, None, "upstream")
+			.await
 			.next()
 			.await
 			.unwrap()
@@ -234,8 +236,8 @@ async fn checks_and_binding_do_not_count_as_activity_but_accepted_requests_do() 
 	let binding = access.binding.clone().unwrap();
 	let before = Instant::now() - Duration::from_secs(100);
 	*binding.last_access.lock().unwrap() = before;
-	access.check().unwrap();
-	access.check_async().await.unwrap();
+	access.check().await.unwrap();
+	access.check().await.unwrap();
 	access.bind(binding.clone()).await.unwrap();
 	assert!(
 		access
@@ -294,6 +296,7 @@ async fn only_authorized_correlated_messages_refresh_the_binding() {
 			serde_json::from_value(message).unwrap(),
 		)]));
 		let result = protect_messages(messages, &context, Some(&request), "upstream")
+			.await
 			.next()
 			.await;
 		if case == "accepted" {
@@ -356,4 +359,133 @@ async fn activity_cannot_revive_idle_old_foreign_revoked_or_denied_sessions() {
 		);
 		assert_eq!(*binding.last_access.lock().unwrap(), before, "{case}");
 	}
+}
+
+#[tokio::test]
+async fn periodic_authorization_keeps_polling_storage_owner_and_withholds_denied_result() {
+	for deny in [false, true] {
+		let mut access = access();
+		access.limits.reauthorize_seconds = 1;
+		let transaction = Arc::new(tokio::sync::Mutex::new(()));
+		let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let source = async {
+			let _owner = transaction.lock().await;
+			tokio::time::sleep(Duration::from_millis(1100)).await;
+			completed.store(true, Ordering::Release);
+			"protected bytes"
+		};
+		let result = access
+			.checked_wait(
+				source,
+				tokio::time::Instant::now() + Duration::from_secs(3),
+				|| {
+					Box::pin(async {
+						let _owner = transaction.lock().await;
+						if deny && completed.load(Ordering::Acquire) {
+							return Err(access.denial("revoked"));
+						}
+						Ok(())
+					})
+				},
+			)
+			.await;
+		assert!(
+			completed.load(Ordering::Acquire),
+			"the pending reader must release its transaction"
+		);
+		if deny {
+			assert!(result.is_err());
+		} else {
+			assert_eq!(result.unwrap(), "protected bytes");
+		}
+	}
+}
+
+#[cfg(feature = "security-rag-sqlite")]
+#[tokio::test]
+async fn sqlite_session_context_is_checked_natively_and_acknowledged_revocation_denies_use() {
+	use security_integration_runtime::{
+		context_store::ContextBinding,
+		rag_sqlite::{SqliteRagConfig, SqliteRagStore},
+	};
+	let directory = std::env::temp_dir().join(format!("mcp-sqlite-context-{}", uuid::Uuid::new_v4()));
+	let mut builder = std::fs::DirBuilder::new();
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::DirBuilderExt;
+		builder.mode(0o700);
+	}
+	builder.create(&directory).unwrap();
+	let mut access = access();
+	let mut config = (*access.config).clone();
+	let sqlite = SqliteRagConfig {
+		path: directory.join("rag.db"),
+		namespace: "mcp-native".into(),
+		max_documents: 16,
+		max_contexts: 16,
+		max_database_bytes: 1048576,
+		busy_timeout_millis: 100,
+	};
+	config.cross_component = Some(serde_json::from_value(json!({"namespace":"mcp-native", "maxContexts":16,
+		"sqlite":sqlite, "destinations":[{"classification":"public"},{"classification":"internal"},{"classification":"restricted"}]})).unwrap());
+	config
+		.cross_component
+		.as_ref()
+		.unwrap()
+		.prepare_store_async()
+		.await
+		.unwrap();
+	let store = SqliteRagStore::open_shared(sqlite).await.unwrap();
+	let binding = ContextBinding {
+		owner: access.owner.clone(),
+		namespace: "mcp-native".into(),
+		fingerprint: crate::security::configuration_fingerprint(&config).unwrap(),
+	};
+	let id = store
+		.issue_documents(
+			binding.clone(),
+			60,
+			security_types::DataClassification::Restricted,
+			vec![],
+		)
+		.await
+		.unwrap();
+	let claims = crate::http::jwt::Claims { inner: serde_json::from_value(json!({"iss":"https://issuer.example", "sub":"alice", "tenantId":"tenant-a", "clientId":"client-a", "exp":access.expires})).unwrap(), jwt: "verified-extension".into() };
+	let mut headers = http::HeaderMap::new();
+	headers.insert(crate::security_flow::HEADER, id.parse().unwrap());
+	let mut extensions = http::Extensions::new();
+	extensions.insert(claims);
+	let flow = crate::security_flow::prepare_async(&config, &headers, &extensions)
+		.await
+		.unwrap()
+		.unwrap();
+	Arc::get_mut(access.binding.as_mut().unwrap()).unwrap().flow = Some(flow.clone());
+	access.flow = Some(flow);
+	access.config = Arc::new(config);
+	access.check().await.unwrap();
+	// A provider/request gate may carry another Context than the Session gate. Both must pass.
+	let second = store
+		.issue_documents(
+			binding.clone(),
+			60,
+			security_types::DataClassification::Restricted,
+			vec![],
+		)
+		.await
+		.unwrap();
+	headers.insert(crate::security_flow::HEADER, second.parse().unwrap());
+	let inherited = crate::security_flow::prepare_async(&access.config, &headers, &extensions)
+		.await
+		.unwrap()
+		.unwrap();
+	let mut request = http::Request::new(());
+	request.extensions_mut().insert(access.clone());
+	request.extensions_mut().insert(inherited);
+	store.revoke(&second, &binding).await.unwrap();
+	assert!(crate::mcp::dispatch::current_async(&request).await.is_err());
+	drop(request);
+	store.revoke(&id, &binding).await.unwrap();
+	assert!(access.check().await.is_err());
+	drop((access, store));
+	std::fs::remove_dir_all(directory).unwrap();
 }

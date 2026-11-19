@@ -295,6 +295,73 @@ pub struct DocumentLifecycleStore {
 	authority: String,
 	state: Mutex<State>,
 }
+/// Durable document authority used by ingestion, retrieval and lifecycle operations. Context
+/// stores may validate these same records in their own transaction; an index is never authority.
+#[async_trait::async_trait]
+pub trait DocumentLifecycle: Send + Sync {
+	async fn begin_index(
+		&self,
+		document: &IndexedDocument,
+		access: TrustedChunkAccess,
+	) -> Result<DocumentMetadata, String>;
+	async fn activate(&self, key: &DocumentKey, revision: u64) -> Result<(), String>;
+	async fn get(&self, key: &DocumentKey) -> Result<DocumentMetadata, String>;
+	async fn mutate(
+		&self,
+		key: &DocumentKey,
+		expected_revision: u64,
+		mutation: DocumentMutation,
+	) -> Result<DocumentMetadata, String>;
+	async fn filter_chunks(
+		&self,
+		chunks: &[KnowledgeChunk],
+		subject: &Subject,
+	) -> Result<Vec<KnowledgeChunk>, String>;
+	async fn validate_documents(
+		&self,
+		subject: &Subject,
+		documents: &[DocumentVersion],
+	) -> Result<(), String>;
+}
+
+#[async_trait::async_trait]
+impl DocumentLifecycle for DocumentLifecycleStore {
+	async fn begin_index(
+		&self,
+		document: &IndexedDocument,
+		access: TrustedChunkAccess,
+	) -> Result<DocumentMetadata, String> {
+		Self::begin_index(self, document, access)
+	}
+	async fn activate(&self, key: &DocumentKey, revision: u64) -> Result<(), String> {
+		Self::activate(self, key, revision)
+	}
+	async fn get(&self, key: &DocumentKey) -> Result<DocumentMetadata, String> {
+		Self::get(self, key)
+	}
+	async fn mutate(
+		&self,
+		key: &DocumentKey,
+		expected_revision: u64,
+		mutation: DocumentMutation,
+	) -> Result<DocumentMetadata, String> {
+		Self::mutate(self, key, expected_revision, mutation)
+	}
+	async fn filter_chunks(
+		&self,
+		chunks: &[KnowledgeChunk],
+		subject: &Subject,
+	) -> Result<Vec<KnowledgeChunk>, String> {
+		Self::filter_chunks(self, chunks, subject)
+	}
+	async fn validate_documents(
+		&self,
+		subject: &Subject,
+		documents: &[DocumentVersion],
+	) -> Result<(), String> {
+		DocumentVersionValidator::validate_documents(self, subject, documents)
+	}
+}
 type Registry = HashMap<std::path::PathBuf, Weak<DocumentLifecycleStore>>;
 static STORES: OnceLock<Mutex<Registry>> = OnceLock::new();
 impl DocumentLifecycleStore {
@@ -317,6 +384,31 @@ impl DocumentLifecycleStore {
 				.check()?;
 			return Ok(existing);
 		}
+		let store = Self::load(config, true)?;
+		registry.insert(path, Arc::downgrade(&store));
+		Ok(store)
+	}
+	/// Exclusive, offline journal replay for explicit migration. Never appends or repairs.
+	pub fn open_for_import(config: DocumentLifecycleConfig) -> Result<Arc<Self>, String> {
+		config.validate()?;
+		std::fs::symlink_metadata(&config.storage.path)
+			.map_err(|_| "source document journal missing")?;
+		Self::load(config, false)
+	}
+	/// The returned records are data, not authorization grants. Retain this store to hold its lock.
+	pub fn import_records(&self) -> Result<(String, Vec<DocumentMetadata>, i64), String> {
+		let mut state = self
+			.state
+			.lock()
+			.map_err(|_| "document source unavailable")?;
+		state.check()?;
+		Ok((
+			self.authority.clone(),
+			state.records.values().cloned().collect(),
+			state.highwater,
+		))
+	}
+	fn load(config: DocumentLifecycleConfig, checkpoint: bool) -> Result<Arc<Self>, String> {
 		let mut sequence = 0_u64;
 		let mut highwater = 0;
 		let mut authority = uuid::Uuid::new_v4().to_string();
@@ -370,6 +462,9 @@ impl DocumentLifecycleStore {
 		})
 		.map_err(|e| format!("cannot open document authority: {e}"))?;
 		let fresh = journal.is_fresh();
+		if fresh && !checkpoint {
+			return Err("migration requires an existing source journal".into());
+		}
 		let mut state = State {
 			journal,
 			records,
@@ -377,23 +472,24 @@ impl DocumentLifecycleStore {
 			highwater,
 			healthy: true,
 		};
-		state.commit(if fresh {
-			Change::Header {
-				namespace: config.namespace.clone(),
-				capacity: config.max_documents,
-				authority: authority.clone(),
-			}
-		} else {
-			Change::Checkpoint
-		})?;
-		let store = Arc::new(Self {
+		if checkpoint {
+			state.commit(if fresh {
+				Change::Header {
+					namespace: config.namespace.clone(),
+					capacity: config.max_documents,
+					authority: authority.clone(),
+				}
+			} else {
+				Change::Checkpoint
+			})?;
+		}
+		Ok(Arc::new(Self {
 			config,
 			authority,
 			state: Mutex::new(state),
-		});
-		registry.insert(path, Arc::downgrade(&store));
-		Ok(store)
+		}))
 	}
+
 	pub fn get(&self, key: &DocumentKey) -> Result<DocumentMetadata, String> {
 		key.validate()?;
 		let mut state = self
@@ -646,7 +742,7 @@ impl<T: DocumentPurger + ?Sized> DocumentPurger for Arc<T> {
 }
 pub struct LifecycleBackend<B> {
 	pub backend: B,
-	pub store: Option<Arc<DocumentLifecycleStore>>,
+	pub store: Option<Arc<dyn DocumentLifecycle>>,
 	pub default_access: TrustedChunkAccess,
 }
 
@@ -656,7 +752,9 @@ impl<B: DocumentIngestBackend> DocumentIngestBackend for LifecycleBackend<B> {
 		let Some(store) = &self.store else {
 			return self.backend.index(document).await;
 		};
-		let meta = store.begin_index(&document, self.default_access.clone())?;
+		let meta = store
+			.begin_index(&document, self.default_access.clone())
+			.await?;
 		document.source_origin = SourceOrigin::Lifecycle {
 			authority: meta.authority,
 			version: meta.version,
@@ -664,11 +762,13 @@ impl<B: DocumentIngestBackend> DocumentIngestBackend for LifecycleBackend<B> {
 			origin: Box::new(document.source_origin),
 		};
 		self.backend.index(document).await?;
-		store.activate(&meta.key, meta.revision)
+		store.activate(&meta.key, meta.revision).await
 	}
 	async fn quarantine(&self, document: QuarantinedDocument) -> Result<(), String> {
 		if let Some(store) = &self.store {
-			store.begin_index(&document.document, self.default_access.clone())?;
+			store
+				.begin_index(&document.document, self.default_access.clone())
+				.await?;
 		}
 		self.backend.quarantine(document).await
 	}
@@ -694,7 +794,7 @@ impl<B: RetrievalBackend> RetrievalBackend for LifecycleBackend<B> {
 			agent_id: filter.agent_id,
 			delegation_id: None,
 		};
-		store.filter_chunks(&chunks, &subject)
+		store.filter_chunks(&chunks, &subject).await
 	}
 }
 

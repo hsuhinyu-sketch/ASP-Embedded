@@ -36,13 +36,23 @@ class Model(http.server.BaseHTTPRequestHandler):
         with self.server.condition:
             self.server.requests.append((self.path, dict(self.headers), body))
             self.server.condition.notify_all()
+        if hook := getattr(self.server, 'before_reply', None):
+            if status := hook():
+                self.send_response(status)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
         def value(text, stream=False):
             return {'id': 'business', 'object': 'chat.completion.chunk' if stream else 'chat.completion',
                     'created': 1, 'model': 'local', 'choices': [{'index': 0, 'finish_reason': None if stream else 'stop',
                     'delta' if stream else 'message': {'role': 'assistant', 'content': text}}]}
         if not body.get('stream'):
             text = 'Answer from retrieved evidence: ' + body['messages'][-1]['content']
-            encoded = json.dumps(value(text)).encode()
+            completion = value(text)
+            if (message := getattr(self.server, 'completion_message', None)) is not None:
+                completion['choices'][0]['message'] = message
+                completion['choices'][0]['finish_reason'] = 'tool_calls' if message.get('tool_calls') else 'stop'
+            encoded = json.dumps(completion).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(encoded)))
@@ -58,11 +68,15 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.wfile.write(f'{len(data):x}\r\n'.encode() + data + b'\r\n')
             self.wfile.flush()
         try:
-            send('BEFORE_BUSINESS_REVOKE')
-            self.server.started.set()
-            if not self.server.release.wait(8):
-                raise TimeoutError('business fixture did not release model stream')
-            send('AFTER_BUSINESS_REVOKE')
+            if frames := getattr(self.server, 'stream_frames', 0):
+                for index in range(frames):
+                    send(f'FRAME_{index}')
+            else:
+                send('BEFORE_BUSINESS_REVOKE')
+                self.server.started.set()
+                if not self.server.release.wait(8):
+                    raise TimeoutError('business fixture did not release model stream')
+                send('AFTER_BUSINESS_REVOKE')
             self.wfile.write(b'0\r\n\r\n')
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -191,6 +205,110 @@ class RagLlmFixture(RagFixture):
 
 class RagLlm(RagLlmFixture):
     evidence = {}
+
+    def configure_restricted_payloads(self, *, allow_model=False, enabled=True):
+        flow = self.system['security']['crossComponent']
+        if enabled:
+            flow['restrictUntrustedPayloads'] = True
+        if not allow_model:
+            for policy in flow['destinations']:
+                if policy['classification'] == 'restricted':
+                    policy['modelDestinations'] = []
+        self.system['rag']['ingestion'] = {'defaultClassification': 'public'}
+        target = f'127.0.0.1:{self.backend.server_port}'
+        self.system['security']['dependencyEgress'] = {
+            'requireTls': False, 'destinations': {'embedding': [target], 'qdrant': [target]},
+        }
+
+    def test_restricted_payload_policy_denies_public_only_model(self):
+        self.configure_restricted_payloads()
+        context, result = self.begin()
+        self.assertEqual(result['classification'], 'public')
+        self.assertTrue(result['chunks'])
+        # Arbitrary caller input is Restricted even in a low-class Context.
+        for candidate, token in [(context, True), (None, True), (context, self.gateway.token(tenant='other'))]:
+            self.assert_blocked(self.generate(candidate, result, token=token), 0)
+        fresh, result = self.context()
+        self.assertNotEqual(fresh, context)
+        self.assert_blocked(self.generate(fresh, result), 0)
+        self.evidence[self.id()] = {'contextClassification': 'public', 'upstreamModelCalls': 0}
+
+    def test_restricted_payload_policy_allows_approved_model_and_rechecks_context(self):
+        self.configure_restricted_payloads(allow_model=True)
+        audit = self.directory / 'audit'
+        audit.mkdir(mode=0o700)
+        self.config['config']['securityAudit'] = {'directory': str(audit)}
+        self.system['security']['requiredAudit'] = {'actionTypes': ['modelInvoke']}
+        context, result = self.begin()
+        self.assertEqual(result['classification'], 'public')
+        self.assertEqual(self.generate(context, result)[0], 200)
+        self.assertEqual(len(self.model.requests), 1)
+        self.assertEqual(self.model.requests[-1][2]['messages'][-1]['content'], result['chunks'][0]['content'])
+        self.assert_blocked(self.generate(None, result), 1)
+        # Authorized model access survives a restart with the same configuration and journal.
+        self.gateway.stop()
+        self.start()
+        self.assertEqual(self.generate(context, result)[0], 200)
+        self.assertEqual(self.revoke(context)[0], 200)
+        self.assert_blocked(self.generate(context, result), 2)
+        self.evidence[self.id()] = {'approvedCalls': 2, 'revokedContextUpstreamCalls': 0}
+
+    def test_enabling_restricted_payload_policy_replaces_legacy_generation(self):
+        # Allow the same model in both generations so denial isolates the Context binding.
+        self.configure_restricted_payloads(allow_model=True, enabled=False)
+        legacy, result = self.begin()
+        self.assertEqual(self.generate(legacy, result)[0], 200)
+        self.system['security']['crossComponent']['restrictUntrustedPayloads'] = True
+        self.reload()
+        self.assert_blocked(self.generate(legacy, result), 1)
+        fresh, result = self.context()
+        self.assertEqual(result['classification'], 'public')
+        self.assertEqual(self.generate(fresh, result)[0], 200)
+        self.assertEqual(len(self.model.requests), 2)
+        self.config['binds'] = [{'port': 18080, 'listeners': [{'protocol': 'HTTP', 'routes': []}]}]
+        self.reload(successful=False)
+        self.assert_blocked(self.generate(legacy, result), 2)
+        self.assertEqual(self.generate(fresh, result)[0], 200)
+        self.assertEqual(len(self.model.requests), 3)
+
+    def test_restricted_payload_config_rejects_unverified_routes_and_dependencies(self):
+        self.configure_restricted_payloads(allow_model=True)
+        def validate(config):
+            self.gateway.config.write_text(json.dumps(config))
+            return subprocess.run([self.gateway.binary, '--file', str(self.gateway.config), '--validate-only'],
+                                  capture_output=True, text=True, timeout=10)
+
+        result = validate(self.config)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cases = {
+            'additional bind': (('binds',), [{'port': 18080, 'listeners': [{'protocol': 'HTTP', 'routes': []}]}]),
+            'agent': (('aiSystems', 0, 'a2a'), {'port': 18081, 'backend': {'host': '127.0.0.1:18082'}}),
+            'MCP': (('aiSystems', 0, 'mcp'), {'port': 18081, 'targets': [{'name': 'dev', 'mcp': {
+                'host': 'http://127.0.0.1:18082/mcp'}}]}),
+            'passthrough': (('aiSystems', 0, 'llm', 'models', 0, 'passthrough'), 'opaque'),
+            'no fixed URL': (('aiSystems', 0, 'llm', 'models', 0, 'params', 'baseUrl'), None),
+            'no strict JWT': (('aiSystems', 0, 'llm', 'policies', 'jwtAuth'), None),
+            'external processor': (('aiSystems', 0, 'llm', 'policies', 'extProc'),
+                                   {'host': '127.0.0.1:18082'}),
+            'no dependency policy': (('aiSystems', 0, 'security', 'dependencyEgress'), None),
+            'denied embedding': (('aiSystems', 0, 'security', 'dependencyEgress', 'destinations', 'embedding'), []),
+        }
+        for name, (path, value) in cases.items():
+            with self.subTest(name=name):
+                config = copy.deepcopy(self.config)
+                node = config
+                for key in path[:-1]:
+                    node = node[key]
+                node[path[-1]] = value
+                if name == 'MCP':
+                    # Satisfy the ordinary MCP contract to exercise the strict-mode rejection.
+                    config['aiSystems'][0]['security']['mcpSessions'] = {'maxSessions': 2}
+                result = validate(config)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn('dependencyEgress denied Embedding' if name == 'denied embedding'
+                              else 'crossComponent.restrictUntrustedPayloads', result.stderr)
+        self.assertFalse(self.model.requests)
+        self.assertFalse(self.backend.calls)
 
     def test_query_context_generation_uses_actual_guarded_chunks(self):
         context, result = self.begin()

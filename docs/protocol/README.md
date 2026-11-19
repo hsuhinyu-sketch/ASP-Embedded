@@ -2,14 +2,20 @@
 
 <!-- doc-role: reference -->
 
-LLM、MCP、A2A、RAG 组件承担协议编解码、分类、路由和协议状态转换；共享 Runtime Host 提供可信入口、配置装配、网络/凭据、必要安全状态及最终受保护执行。依赖关系见[架构说明](../architecture/README.md)。
+项目级接口约定和安全职责见开发总纲。跨协议身份、授权、出口、流和恢复的检查点见执行契约。支持的协议版本和传输由当前实现及对应回归确定。[开发总纲](../DEV.md#安全与接口规范) · [统一安全执行约束](execution-contract.md)
 
-## 执行约束
+## 跨协议攻击回归
 
-[统一安全执行约束](execution-contract.md)描述跨协议的身份、请求关联、授权、出口、流和恢复边界。其概念名称表示职责与语义，不要求为每个概念创建 API、通用框架或新的安全模型。
+`cross-protocol-attacks` profile 使用真实 Gateway、本地 RAG／工具／Agent 替身与确定性模型输出，覆盖文档和工具返回注入、参数篡改、身份伪造、出口限制、Context 替换、撤销竞争及模型出口 PII。模型会按攻击计划产生工具调用，业务驱动将其提交到真实接口；以实际上游调用、工具副作用、响应披露和正常业务对照判定执行约束。它不测量真实模型被注入的概率，也不代表未知攻击检出率。
 
-`SecurityMode` 默认 `Audit`；Audit/Shadow 中一般策略拒绝不阻断，Enforce 才执行拒绝。会话、对象、预算等专项控制、解析错误和硬性传输限制有各自的条件。编译 `security-s1` 不等于开启强制模式；具体行为见 [SecurityConfig/evaluate_with_audit](../../crates/security/integration-runtime/src/lib.rs)。
+```sh
+python3 tests/protocol/run_full_tcp.py --binary /absolute/path/to/ai-security-platform \
+  --profile cross-protocol-attacks --rounds 1 --launcher sudo \
+  --report /absolute/path/to/new-attack-report.json
+```
 
-配置引用未编译的能力应在接纳时拒绝。协议 Handler 只能通过受保护操作产生副作用，不能把路由结果或普通网络接口当作执行许可。MCP Sampling 使用受控模型执行契约；对象与长生命周期操作继续保留身份绑定、持续校验、预算和审计。
+产物需支持 LLM、MCP、A2A、RAG 和 Native PII；夹具显式启用 Enforce、可信 JWT、Context 及持久 Required Audit。详细输入、预期、实际调用和审计关联见报告的 `evidence`。该命令使用现有隔离回环入口，不访问云端。
 
-支持的协议名称、版本和传输以源码为准；项目不据旧阶段文档推断最新外部规范符合性。使用方式见[配置参考](../reference/configuration-guide.md)与[业务示例](../examples/rag-llm-poc.md)。
+`cross-protocol-corpus` profile使用[24例手写诊断对照](../../tests/protocol/fixtures/cross-protocol-content.json)，沿真实RAG→OpenAI兼容Mock API→MCP接口分别记录内容过滤与执行结果。上述命令替换profile为`cross-protocol-corpus`即可运行。报告的`detectionMetrics`给出精确率、召回率与正常样本误移除率；`executionMetrics`记录实际未授权工具调用尝试与副作用。Mock只按样本暴露情况产生预设工具调用，不执行语义推理，`realModelAttackSuccessRate`保持未评估。测试通过表示流程／观察和执行约束成立，不能代表检测准确率达标；这组人为对照不是生产分布或留出数据集。
+
+用 `--profile context-guard-comparison` 在同一产物上比较 `legacy` 与 `contextual`。两套规则各运行诊断 24 例和[合成留出 12 例](../../tests/protocol/fixtures/context-guard-holdout.json)。`detectionComparison` 按样本集、规则集和家族汇总。验收要求既有检出样本逐例保持、留出集误删减少、诊断集误删无增加，并检查正常流程和实际工具副作用。结果只适用于这两组固定样本。

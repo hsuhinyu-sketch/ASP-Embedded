@@ -14,35 +14,60 @@ struct ParentGuard {
 	access: SessionAccess,
 }
 impl Guard for ParentGuard {
-	fn check(&self) -> Result<(), ProxyError> {
-		if !self.parent.is_live() {
-			return Err(self.access.denial("task-sampling-parent-closed"));
-		}
-		let task = self
-			.parent
-			.task
-			.as_ref()
-			.ok_or(ProxyError::AuthorizationFailed)?;
-		for phase in ["request", "respond"] {
-			task.check(&self.access, "sampling/createMessage", phase)?;
-			authorize_inner(
-				&self.access,
-				&self.parent.server,
-				"sampling/createMessage",
-				phase,
-				true,
-			)?;
-		}
-		check_business(&self.access, &self.parent)
+	fn check(&self) -> gateway_protocol_core::execution::ExecutionFuture<'_, (), ProxyError> {
+		Box::pin(async move {
+			if !self.parent.is_live() {
+				return Err(self.access.denial("task-sampling-parent-closed"));
+			}
+			let task = self
+				.parent
+				.task
+				.as_ref()
+				.ok_or(ProxyError::AuthorizationFailed)?;
+			for phase in ["request", "respond"] {
+				task
+					.check(&self.access, "sampling/createMessage", phase)
+					.await?;
+				authorize_inner(
+					&self.access,
+					&self.parent.server,
+					"sampling/createMessage",
+					phase,
+					true,
+				)
+				.await?;
+			}
+			check_business(&self.access, &self.parent).await
+		})
 	}
 
-	fn correlate(&self, request_id: String) -> Result<(), ProxyError> {
-		self
-			.parent
-			.task
-			.as_ref()
-			.ok_or(ProxyError::AuthorizationFailed)?
-			.correlate_model(&self.access, request_id)
+	fn current(&self) -> Result<(), ProxyError> {
+		self.access.current_local()?;
+		if !self.parent.is_live()
+			|| !self
+				.parent
+				.task
+				.as_ref()
+				.is_some_and(|task| task.answerable())
+		{
+			return Err(self.access.denial("task-sampling-parent-closed"));
+		}
+		Ok(())
+	}
+
+	fn correlate(
+		&self,
+		request_id: String,
+	) -> gateway_protocol_core::execution::ExecutionFuture<'_, (), ProxyError> {
+		Box::pin(async move {
+			self
+				.parent
+				.task
+				.as_ref()
+				.ok_or(ProxyError::AuthorizationFailed)?
+				.correlate_model(&self.access, request_id)
+				.await
+		})
 	}
 
 	fn denial(&self, reason: &str) -> ProxyError {
@@ -102,7 +127,7 @@ pub(crate) async fn execute(
 		parent: parent.clone(),
 		access: access.clone(),
 	});
-	guard.check()?;
+	guard.check().await?;
 	let executor = route.bind(
 		model_execution::Target {
 			authority: cfg.authority.clone(),
@@ -128,10 +153,10 @@ pub(crate) async fn execute(
 	);
 	let generation = async {
 		let result = sampling.generate(&executor).await?;
-		guard.check()?;
+		guard.check().await?;
 		let answer = serde_json::from_value(json!({"jsonrpc":"2.0","id":rpc["id"],"result":result}))
 			.map_err(|_| access.denial("task-sampling-output-shape"))?;
-		let (server, answer, action, ticket) = response_inner(access, answer, true)?;
+		let (server, answer, action, ticket) = response_inner(access, answer, true).await?;
 		let ticket = ticket.ok_or(ProxyError::AuthorizationFailed)?;
 		let mut context = transport.context.clone();
 		context
@@ -162,19 +187,12 @@ pub(crate) async fn execute(
 			.map_err(|_| access.denial("task-sampling-reply-failed"))?;
 		Ok(())
 	};
-	// Keep the parent responsible for cancellation/deadline/re-authorization. No spawned producer.
+	// The same wait drives both the generation and periodic parent authorization, so a
+	// generation holding the Context transaction cannot be frozen by its own recheck.
 	let run = async {
-		let mut revision = access.revision.clone();
-		tokio::pin!(generation);
-		loop {
-			tokio::select! {
-				biased;
-				_ = revision.changed() => return Err(access.denial("task-sampling-config-changed")),
-				_ = tokio::time::sleep_until(deadline.into()) => return Err(access.denial("task-sampling-timeout")),
-				_ = tokio::time::sleep(Duration::from_secs(access.limits.reauthorize_seconds)) => { guard.check()?; },
-				result = &mut generation => return result,
-			}
-		}
+		access
+			.checked_wait(generation, deadline.into(), || guard.check())
+			.await?
 	};
 	scope.run(run).await?
 }

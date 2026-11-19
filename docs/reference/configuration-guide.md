@@ -2,12 +2,14 @@
 
 <!-- doc-role: reference -->
 
-本文件介绍已有配置与接口。项目目标见[项目入口](../README.md)，组件职责和扩展方式见[架构说明](../architecture/README.md)。
+本文件维护配置字段、运行约束与接口行为。项目级约定、场景构建和发布步骤分别见[开发总纲](../DEV.md)、[场景配置](../README.md#安全网关场景-profile)和[发布指南](../release/README.md)。
 
-示例包含片段、占位地址与不同安全模式，需要按业务补全凭据、认证和安全策略；不表示可以直接投产。构建能力选择见[发布指南](../release/README.md)。编译安全组件不等于开启 Enforce，观察模式不会一般性阻断。
-
-平台面向生产级端侧开发，但目标设备发布门禁尚未通过。文中“PoC/进程内”只描述特定示例或后端，不定义整个平台目标。已有文件审计/状态日志和远程受信 Broker 接入；本地 Broker 的默认 Store 仍为进程内实现，跨重启/多实例保证须按实际存储验证。受保护 Tool/API 必须校验可信身份/Capability，不能以示例配置代替执行边界。
-
+| 查找内容 | 入口 |
+| --- | --- |
+| 启动与运行运维 | [热更新](#startup-configuration-and-hot-updates)、[持久审计](#managed-security-audit-operations)、[监听与就绪](#listener-lifecycle-and-readiness) |
+| AI 系统配置 | [RAG](#rag-retrieval-security)、[MCP 路由](#mcp-route-configuration)、[场景装配](#ai-system-gateway-composition)、[严格出口与联合存储](#restrict-untrusted-model-payloads) |
+| 身份与执行控制 | [安全管线](#composable-security-pipeline)、[通用控制](#s0s1-common-security-controls)、[高风险工具](#s3-a-high-risk-tool-gate)、[远程 PDP 与撤销](#s4-b-remote-pdp-and-delegation-revocation) |
+| 请求内容 | [PII 配置与适用范围](#pii-security-component-v01) |
 
 ## Startup configuration and hot updates
 
@@ -29,6 +31,102 @@ require a restart. Restore the original startup section to apply a corrected dyn
 Rust embedders should construct `Config` through `config::parse_config`; the private startup
 snapshot is skipped from configuration dumps and redacted in Debug.
 
+`config.bindAddress` optionally selects a literal IP address for local-config protocol listeners
+(`binds`, LLM, MCP and A2A), for example `127.0.0.1` for a local-only process. The default retains
+the existing wildcard behavior. IPv6 addresses require IPv6 to be enabled. It is a startup-only
+setting; management, stats, readiness and the separately mounted RAG listener retain their own
+address settings. The [local device assistant](../examples/tool-agent-poc.md#纯端侧设备助手)
+uses this with existing component features and offline identity/policy/audit configuration.
+
+
+## Managed security audit operations
+
+`config.securityAudit` configures the existing single-writer journal. Required Audit acknowledges
+an operation only after its record is persisted; capacity pressure never disables this requirement.
+The source directory must already exist with private permissions. Defaults remain 16 MiB per
+segment, eight segments and seven days of retention; the segment capacity excludes the small
+control journal. Retention deletes only expired **closed prefixes**, never unexpired evidence or
+the current open segment.
+
+```yaml
+config:
+  management:
+    mode: diagnostic
+  securityAudit:
+    directory: /var/lib/ai-security-platform/audit
+    maxSegmentBytes: 16777216
+    maxSegments: 8
+    retentionSeconds: 604800
+```
+
+These are startup settings. Each journal also persists its configuration: reopening an existing
+directory requires the same canonical directory and limits. Editing the YAML and restarting does
+not resize or migrate existing evidence. Directory/configuration migration and export are separate
+operations; this release does not automatically rotate to a new audit authority or release evidence
+on an export acknowledgement.
+
+### Capacity status and warning
+
+`GET /api/security/audit` is available on the existing local management listener. Diagnostic and demo modes permit the read; edge mode continues to deny it. The listener
+remains restricted to loopback or Unix sockets and preserves the local Host check. This is a local
+exposure policy, not remote administrator authentication. The response contains operational counters
+and capacity metadata, not event records, identities, prompts, credentials or filesystem paths.
+
+```sh
+curl --fail http://127.0.0.1:15000/api/security/audit
+```
+
+Use the configured `adminAddr` port. Fields include `persistenceEnabled`, `persistenceHealthy`,
+`persistenceFailures` and an optional `capacity` object. Its `state` is `ready`, `high`, `exhausted`
+or `failed`; `usedBytes`, `maximumBytes`, `writableBytes`, segment counts, `controlBytes`,
+`retentionSeconds`, `nextSequence`, `lastCommitMillis` and `nextReclaimAtMillis` describe the writer.
+`writableBytes` includes the current segment and unused slots, not slack in closed segments.
+`nextReclaimAtMillis` is the earliest closed-prefix retention deadline, not an admission promise.
+Legacy or in-memory sinks have no managed capacity object.
+
+The Host logs a warning when writable capacity reaches 20% or less, and logs exhaustion, recovery
+and permanent failure on state changes. Polling does not scan files, prune evidence, reserve space
+or grant authorization: status reflects the most recent writer/recovery validation. Capacity pressure
+may still permit a smaller record; it remains reported until reclamation. Actual admissions always
+perform their own persistence checks. Commit failure counters are cumulative and do not reset after
+capacity recovery.
+
+A capacity rejection occurs before writing that record and does not consume its durable sequence.
+Later requests may reclaim eligible expired closed segments and resume with continuous committed
+IDs. A true I/O error, replacement, truncation, permission violation or invalid journal remains
+quarantined; repairing the filesystem requires a restart and full validation. A fitting ordinary
+denial record may still be appended during pressure; it does not allow the failed operation to run.
+Failed commits do not create gaps in the durable sequence.
+
+### Offline export
+
+Stop the Gateway and run the same binary against its YAML/JSON configuration:
+
+```sh
+ai-security-platform export-audit --file /path/to/gateway.yaml \
+  --output /path/to/new-audit-archive
+```
+
+The command uses the Gateway's normal YAML/JSON parser and environment-variable expansion,
+reads `config.securityAudit`, and uses the normal exclusive source writer locks and journal
+validation. It does not start listeners or initialize other protocol/security state. A live
+writer, missing/corrupt source, existing destination or destination inside the source directory is
+rejected. The absolute output path needs an existing parent; the archive is created privately
+(directory 0700 and files 0600 on Unix).
+
+Export copies `writer.jsonl` and all retained segments byte for byte, including expired evidence
+that still exists. It does not prune or modify the source. `manifest.json` records the format version,
+original source path, last sequence and copied filenames/lengths; it is written after the copies,
+and completion is reported only after syncing the archive. A failed export can leave an incomplete
+directory: keep it for diagnosis or remove it explicitly before choosing a fresh destination. Do not
+accept a nonzero command exit as a completed archive.
+
+The archive is for evidence inspection/ingestion, not a signed bundle or an automatically portable
+Gateway recovery directory. Source path/configuration binding remains in the original bytes.
+Export **does not free local capacity or shorten retention**. Size the local budget for the agreed
+retention window and observed audit rate, including rotation slack. If the required volume exceeds
+the supported local limit, choose an explicit durable audit backend/retention/export design; neither
+a larger queue nor early deletion provides the required persistence contract.
 
 ## Configuration file watch recovery
 
@@ -213,6 +311,26 @@ configured indirect-instruction signals; Shadow mode preserves it while producin
 staged rollout. Chunks with configured sensitive labels can instead retain their provenance while
 their content is replaced by a redaction marker. This deterministic signal is a PoC safety net;
 a classifier or DLP engine can be added behind the same context-guard boundary later.
+
+To opt in to the contextual rules, set the following under `aiSystems[].rag`.
+
+```yaml
+contextGuard:
+  mode: enforce      # use shadow to observe findings without removing these chunks
+  ruleSet: contextual
+```
+
+Use `ruleSet: legacy` or omit the field to select the original built-in rules. Contextual rules
+normalize case and whitespace and drop a small, fixed set of invisible formatting characters in
+the matching view. The generic English role terms `system message` and `developer message` also
+need an adjacent command signal to match. The remaining built-in phrases still match directly,
+including when quoted. Retained chunks keep their original content, classification, and provenance.
+An explicit `indirectInstructionPatterns` list replaces either built-in set with the existing
+case-insensitive literal matcher. An empty list disables indirect-instruction matching.
+
+The rules inspect individual RAG chunks. They cover a limited set of English signals and still
+miss some paraphrases, translations, encoded content, and instructions split across chunks.
+Tool authorization and data-egress controls apply independently of detector findings.
 
 For example, corpus retrieval remains deny-by-default until an explicit policy permits it:
 
@@ -476,12 +594,109 @@ receive `RagGatewayError::PurgeFailed(DocumentStatus)` for this partial failure.
 records the failure as `rag:document-purge-failed`; index/quarantine failures return a sanitized
 502 and record a Denied ingestion stage with a fixed backend-failure reason.
 
-Rust embedders can enable `security-integration-runtime/rag-sqlite` to use the async
-`rag_sqlite::SqliteRagStore` backend for Context and document state in one database.
-It reuses the journal's document transition, ACL and Context-binding rules; a Context read
-checks documents and commits its clock highwater in one transaction. A returned classification
-is not an execution permit. The current gateway YAML and HTTP handlers still use their existing
-stores: this feature does not select a backend for the Host or import JSONL files.
+### Restrict untrusted model payloads
+
+A dedicated RAG and direct LLM gateway can set
+`aiSystems[].security.crossComponent.restrictUntrustedPayloads: true`. Enable it in
+the Enforce configuration in the [RAG to LLM example](../examples/rag-llm-poc.md) and
+require strict JWT authentication on both listeners. Every model request uses the
+`Restricted` egress level, including free text supplied with a valid public Context.
+The exact outbound destination must be permitted at all three levels. Identity, Context
+ownership, expiry, revocation and document-version checks still apply. A model approved
+at all three levels can process ordinary questions through the same API.
+
+The setting defaults to false. Enabling it changes the workflow configuration binding.
+Clients retrieve a fresh Context after the configuration is accepted. Configure
+`security.dependencyEgress` or the deployment's `config.dependencyEgress` to approve
+the RAG embedding and Qdrant endpoints as handlers of Restricted data. Include trusted
+import sources and any configured security dependencies in the relevant allowlists.
+
+This setting applies to a standalone configuration with one AI system,
+RAG and fixed `openAI` models with explicit `baseUrl`. Configuration validation rejects
+additional routes or listeners, A2A, passthrough, virtual models, backend tunnels,
+external request processing, endpoint picking and custom request telemetry. The operator
+controls access to upstreams and to any separate gateway instance. This policy governs
+requests dispatched by this instance.
+
+The same AI system can also declare one stateful Streamable HTTP MCP target with a fixed
+IP and port. Configure strict MCP JWT authentication and `security.mcpSessions`. Allow each
+intended tool using its exact `server/tool` name in `toolDestinations` at all three levels.
+Transport setup uses the existing server allowlist and tool-derived transport permission.
+MCP exposes initialization, ping, tool listing and synchronous tool calls. Clients using
+sessions can close them with DELETE. The gateway builds upstream HTTP transport headers and
+passes the validated protocol version and gateway-issued capability headers when applicable.
+Configuration validation rejects retry and rewrite policies, Task settings and reverse
+interaction settings. Prompts, resources and separate event streams are refused at runtime.
+
+The optional App/Runtime feature `security-rag-sqlite` enables joint SQLite document/Context
+state for RAG, LLM, MCP and A2A paths. It is not enabled by default. Inside
+`aiSystems[].security.crossComponent`, replace `storage` with an explicit declaration:
+
+```yaml
+namespace: knowledge
+maxContexts: 1024
+sqlite:
+  path: /absolute/private-directory/rag.sqlite
+  namespace: knowledge
+  maxContexts: 1024
+  maxDocuments: 4096
+  maxDatabaseBytes: 1048576
+  busyTimeoutMillis: 100
+```
+
+Keep the existing three `destinations` policies. The nested namespace and Context capacity must
+match the enclosing declaration. Remove `rag.lifecycle` and retain `rag.qdrant.integrity`:
+the SQLite authority supplies the document lifecycle as well as Context state. Matching listener
+generations and RAG/LLM declarations share one live store; incompatible declarations on an owned
+file are rejected. Existing `storage`/`rag.lifecycle` JSONL configurations retain their behavior.
+Missing build support is a configuration error. MCP Session/Task/reverse interaction and A2A
+stream/recovery paths await the same Context authority. Inference/service endpoint selection
+reads the current classification before scanning candidates; final dispatch checks the chosen
+destination again. JSONL remains available and is never converted during startup.
+
+Rust embedders enable `security-integration-runtime/rag-sqlite` and share a
+`rag_sqlite::SqliteRagStore` through `SecurityContextStore::*_async` and the
+`security_rag::lifecycle::DocumentLifecycle` interface. Synchronous Context calls to this backend
+fail instead of waiting for SQL or falling back. It reuses existing document transitions, ACL
+and Context-binding rules: a Context check validates documents and commits the clock highwater
+in one transaction. The classification returned is not an execution permit. Final dispatch,
+JWT/configuration validity, audit and budget checks remain in the Host. Streaming withholds at
+most one frame until its durable check succeeds, and checks validity again before release.
+Idle reauthorization belongs to the raw stream; the final adapted output also validates frames.
+MCP continues polling a pending read while periodic authorization waits for storage, and
+withholds its completed result until authorization succeeds. Final Task/Sampling authorization
+precedes the local expiry, cancellation and single-send checks.
+
+For an explicit **offline** import, build with `security-rag-sqlite`, stop every gateway using
+either source journal, and prepare a YAML or JSON declaration with these fields:
+
+| Field | Required value |
+| --- | --- |
+| `sourceSecurity` | Complete previous `aiSystems[].security`, including `crossComponent.storage`. |
+| `targetSecurity` | The same security declaration, replacing only `crossComponent.storage` with `crossComponent.sqlite`. |
+| `documents` | Previous `rag.lifecycle` declaration, including its namespace, capacity and journal path. |
+
+Run the existing binary's migration subcommand, then install the target gateway configuration:
+
+```sh
+ai-security-platform import-rag-state --file /absolute/private-directory/import.yaml
+```
+
+The destination database must be new; the source files must exist and be exclusively available.
+The importer reuses journal replay/transition validation, holds source locks until the destination
+closes, and does not append to the journals, including full journals. It imports document state
+and unexpired Context records in one transaction, preserving authority, IDs, owner, issuance,
+expiry, classification, revocation and pinned versions. Only the configuration fingerprint is
+rebound after confirming that every security control except storage is identical. Foreign
+declarations, changed policies, malformed sources and existing targets are rejected.
+
+Keep the source files and verify the new configuration before resuming traffic. Import does not
+migrate MCP sessions, workflow budgets, capabilities, A2A Task bindings or recovery cursors;
+those lifecycles retain their existing configuration invalidation behavior. Obtain new sessions
+and workflow lifecycles after the change. On import failure, retain both sources and inspect the
+destination before retrying: a failed transaction may leave an initialized empty database, and
+an interrupted COMMIT may have an unknown outcome. The importer never deletes or merges a
+destination, and never treats a failed/unknown import as permission to fall back.
 
 `SqliteRagConfig` requires an absolute path in a private directory, a namespace, document and
 Context count limits, `max_database_bytes`, and a bounded busy timeout. An open store should be
@@ -505,39 +720,12 @@ not added to these events. For Rust integrations, `IngestionAuditEvent.tenant_id
 
 ### Compile-time gateway profiles
 
-The default `ai-security-platform` build retains every gateway capability. A selected
-profile rejects configuration for
-capabilities that were not selected at build time, so deployment configuration cannot accidentally
-enable an unapproved gateway surface.
-
-```bash
-# LLM only
-cargo build -p ai-security-platform-app --bin ai-security-platform --no-default-features \
-  --features tls-aws-lc,mimalloc,security-s1,gateway-llm
-
-# LLM plus multiple inference endpoints / routing
-cargo build -p ai-security-platform-app --bin ai-security-platform --no-default-features \
-  --features tls-aws-lc,mimalloc,security-s1,gateway-llm,inference-routing
-
-# LLM plus an A2A agent runtime
-cargo build -p ai-security-platform-app --bin ai-security-platform --no-default-features \
-  --features tls-aws-lc,mimalloc,security-s1,gateway-llm,gateway-a2a
-
-# LLM, A2A, and MCP, with common S1 security controls
-cargo build -p ai-security-platform-app --bin ai-security-platform --no-default-features \
-  --features tls-aws-lc,mimalloc,security-s1,gateway-llm,gateway-a2a,gateway-mcp
-```
-
-`gateway-composition` owns the compile-time capability profile and its small trait boundary.
-Protocol implementation is shared between independent `gateway-*` components and the
-`ai-security-platform-runtime` Host. Their responsibilities are described in
-[the architecture](../architecture/README.md); a compiled profile does not certify full protocol independence.
-`runtime-base` bundles cloud SDK, database and OTLP features for broad compatibility; it is
-optional. Select `database`, `telemetry-otlp` and `providers-*` only when the scenario needs them.
-Disabled SQL/OTLP configuration is rejected at startup and hot update; ordinary request logging
-and Trace Context remain available. Required Audit has its own security persistence contract.
-The Runtime still has shared LLM data dependencies, so feature selection does not yet imply
-complete protocol implementation isolation.
+Choose the components listed in the [scene profiles](../README.md#安全网关场景-profile) and
+configure the matching listeners. Startup and hot updates reject configuration that requires a
+missing feature. The optional `runtime-base` bundle includes cloud SDK, database, and OTLP
+features. Choose `database`, `telemetry-otlp`, or `providers-*` individually when the deployment
+only needs selected integrations. Required Audit uses the security journal described above.
+The Host shares LLM data types across several build combinations.
 
 ### S0/S1 common security controls
 
@@ -920,41 +1108,6 @@ security:
     rootCaPemFile: /run/secrets/identity-root-ca.pem
 ```
 
-## Core crates
-
-```text
-crates/security/types
-crates/security/policy
-crates/security/engine
-crates/security/audit
-crates/security/pipeline
-crates/gateway/composition
-crates/security/integration-runtime # configured security and lifecycle adapters
-crates/security/capability-broker    # existing broker/consumer contract and service
-crates/security/rag                  # ingestion, retrieval and context security
-crates/gateway/contracts             # shared configuration revision/lease
-crates/gateway/protocol-core         # shared execution/data contracts
-crates/gateway/llm                   # extracted LLM core; execution extraction incomplete
-crates/gateway/mcp                   # extracted MCP rules/merge and three-method dispatcher
-crates/gateway/a2a                   # extracted A2A envelope/card core
-crates/gateway/rag                   # independent secure RAG adapter
-crates/gateway/runtime               # shared Host plus remaining protocol implementation
-crates/gateway/app           # ai-security-platform-app / ai-security-platform binary
-crates/platform/*            # shared first-party platform utilities
-crates/third-party/*         # retained third-party source dependencies
-```
-
-## Build
-
-```bash
-cargo check -p security-types -p security-policy -p security-engine -p security-audit -p security-pipeline -p ai-security-platform-app
-```
-
-## License
-
-Apache License 2.0. See [LICENSE](../../LICENSE).
-
-
 ## PII Security Component V0.1
 
 `security-pii` 是协议无关的可选内容安全组件，集中检查经本网关受控模型入口发送的请求。可信身份/授权 → 请求默认值、转换前变更、prompt enrichment 与原请求 guard → 完整请求 PII → Provider 编码 → 原最终授权、配置失效、出口、预算和受控发送。直接模型调用、MCP Sampling 和业务组装的 RAG→LLM 使用同一检查点。RAG 本身只执行原有检索授权、Chunk ACL、ContextGuard、分类、Provenance 和预算，返回授权原文；不再额外做 PII。
@@ -1001,7 +1154,7 @@ PII Core 的 Finding 使用 UTF-8 字节范围 `[start,end)`；Presidio Adapter 
 
 PII 检查消息正文、系统指令、历史、工具结果与参数；工具定义/Schema、metadata、`user`、停止文本、工具名称/关联标识及未知扩展继续作为只读数据检查，需要改写时拒绝。仅排除根级类型正确的已知控制字段：`model`、`stream`、`temperature`、`top_p`，以及对应请求格式的 token 上限、Completions 的 penalty/seed 和仅含布尔 `include_usage` 的 `stream_options`；固定角色与已验证的内容 `type` 也不送入检测器。模型名仍受原路由/授权控制，不属于正文脱敏范围。未知角色、控制字段的异常类型、带扩展的 `stream_options` 不因此获得豁免；metadata/工具参数内部即使含有同名键，也继续检查。
 
-`maxTextBytes`/`maxOutputBytes` 限制整个序列化请求，包含未送检的控制字段；`maxFindings` 同时限制单片段和完整请求，最多 128 个送检片段、16 层内容结构，`timeoutMs` 也限制一次完整检查。计价/分词在 PII 之后沿原机制执行，原 Context Budget 不变。
+`maxTextBytes`/`maxOutputBytes` 限制整个序列化请求，包含未送检的控制字段；`maxFindings` 同时限制单片段和完整请求，最多 128 个送检片段、16 层内容结构，`timeoutMs` 也限制一次完整检查。原生检测在候选间检查截止时间并定期让出执行权；单次同步解析不能硬抢占，完成后若已超期，Enforce 拒绝模型出站，Audit/Shadow 记录错误并保留原文。因此该参数不是严格的墙钟耗时上限。计价/分词在 PII 之后沿原机制执行，原 Context Budget 不变。
 
 ### 可选的本地 Presidio Analyzer
 
@@ -1059,3 +1212,11 @@ V0.1 只覆盖经本网关受控模型入口的请求文本；响应/SSE 输出�
 模型入口启用 PII Enforce 时，仅接纳上述 Completions、Messages、Responses 支持文本；Embeddings、Rerank、TokenCount、Detect、Passthrough、Realtime 等未支持路由明确拒绝。Audit/Shadow 对这些路由记录 unsupported 后保留原行为，不声称已检查其内容。RAG 内部直接调用 Embedding 服务不经过该模型入口，不会因此自动加入 PII。
 
 后续 NER/GLiNER/ONNX 后端实现 `PiiDetector` 即可接入同一规范化、策略、匿名化和错误边界；模型实体需显式映射为部署配置的实体名，不能创建新身份/授权引擎。中文姓名质量、模型权重、跨帧缓冲与可逆密钥管理分别验证，不在 V0.1 中预建空框架。
+
+Host 在发布配置前等待 PII readiness。Native 启用 `PHONE_NUMBER` 时，检测器通过阻塞任务准备共享电话元数据及现用地区的常见匹配路径；这会提前驻留缓存并增加首次准备时间。初始化位于单次文本检测的 `timeoutMs` 之外，检测期限与超期结果复核仍按原配置执行。仅邮箱、禁用 PII 和 Presidio 不执行此电话初始化；Presidio 保留原 Analyzer readiness 请求。数据相关的首次匹配和缓存淘汰仍可能产生同步开销，不承诺硬实时返回。
+
+嵌入使用 `PiiEngine` 时，应先等待 `check_ready().await`，成功后再向请求暴露引擎。替代检测器可实现 `PiiDetector::prepare` 完成本地资源准备，默认无需额外准备；准备失败会使 readiness 失败，包括 Audit/Shadow 模式。Host 对同一准备状态去重，取消后不会发布半就绪引擎，可重新准备；已开始的本地阻塞初始化不能硬抢占，但不会携带业务正文或直接产生业务副作用。
+
+### 离线数据集评测入口
+
+Gretel 和 Nemotron-PII 的转换器会核对来源文件与标注，输出统一数据后由同一驱动评分。通过固定样本和本地模型替身验证实体检测、遮盖与拒绝路径。标注质量、电话范围和地区版本会影响指标。使用各脚本的 `--help` 查看输入和产物参数。[Gretel 转换](../../tests/performance/gretel_dataset.py) · [Nemotron 转换](../../tests/performance/nemotron_dataset.py) · [评测驱动](../../tests/performance/run_pii_dataset.py)

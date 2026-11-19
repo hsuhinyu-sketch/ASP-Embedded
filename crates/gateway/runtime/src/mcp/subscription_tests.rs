@@ -1,62 +1,68 @@
 use super::*;
 use serde_json::json;
 
-fn prepare(access: &SessionAccess, subscribe: bool) -> Option<Ticket> {
+async fn prepare(access: &SessionAccess, subscribe: bool) -> Option<Ticket> {
 	let request = serde_json::from_value(json!({"jsonrpc":"2.0","id":1,
 		"method":if subscribe { "resources/subscribe" } else { "resources/unsubscribe" },
 		"params":{"uri":"file:///guide"}}))
 	.unwrap();
 	let mut ctx = super::super::tests::context(access);
-	prepare_subscription(&request, &mut ctx, "docs").unwrap();
+	prepare_subscription(&request, &mut ctx, "docs")
+		.await
+		.unwrap();
 	ctx.extensions_mut().get::<Ticket>().cloned()
 }
 fn update() -> rmcp::model::ServerJsonRpcMessage {
 	serde_json::from_value(json!({"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///guide"}})).unwrap()
 }
 
-#[test]
-fn only_active_subscription_can_disclose_updates() {
+#[tokio::test]
+async fn only_active_subscription_can_disclose_updates() {
 	let access = super::super::tests::access();
-	let ticket = prepare(&access, true).unwrap();
-	assert!(notification(&access, "docs", &update()).is_err());
-	ticket.commit(&access).unwrap();
-	assert!(notification(&access, "docs", &update()).unwrap());
-	assert!(notification(&access, "other-server", &update()).is_err());
-	prepare(&access, false);
-	assert!(notification(&access, "docs", &update()).is_err());
-	assert!(ticket.commit(&access).is_err());
+	let ticket = prepare(&access, true).await.unwrap();
+	assert!(notification(&access, "docs", &update()).await.is_err());
+	ticket.commit(&access).await.unwrap();
+	assert!(notification(&access, "docs", &update()).await.unwrap());
+	assert!(
+		notification(&access, "other-server", &update())
+			.await
+			.is_err()
+	);
+	prepare(&access, false).await;
+	assert!(notification(&access, "docs", &update()).await.is_err());
+	assert!(ticket.commit(&access).await.is_err());
 }
 
-#[test]
-fn cancelled_pending_ack_cannot_activate_replacement_or_foreign_session() {
+#[tokio::test]
+async fn cancelled_pending_ack_cannot_activate_replacement_or_foreign_session() {
 	let access = super::super::tests::access();
-	let stale = prepare(&access, true).unwrap();
-	prepare(&access, false);
-	let replacement = prepare(&access, true).unwrap();
-	assert!(stale.commit(&access).is_err());
+	let stale = prepare(&access, true).await.unwrap();
+	prepare(&access, false).await;
+	let replacement = prepare(&access, true).await.unwrap();
+	assert!(stale.commit(&access).await.is_err());
 	let foreign = super::super::tests::access();
-	assert!(replacement.commit(&foreign).is_err());
-	assert!(notification(&access, "docs", &update()).is_err());
-	replacement.commit(&access).unwrap();
+	assert!(replacement.commit(&foreign).await.is_err());
+	assert!(notification(&access, "docs", &update()).await.is_err());
+	replacement.commit(&access).await.unwrap();
 	drop(stale);
-	assert!(notification(&access, "docs", &update()).unwrap());
+	assert!(notification(&access, "docs", &update()).await.unwrap());
 }
 
-#[test]
-fn failed_or_abandoned_subscribe_releases_capacity() {
+#[tokio::test]
+async fn failed_or_abandoned_subscribe_releases_capacity() {
 	let mut access = super::super::tests::access();
 	access.limits.max_subscriptions = 1;
-	let ticket = prepare(&access, true).unwrap();
+	let ticket = prepare(&access, true).await.unwrap();
 	drop(ticket);
-	let ticket = prepare(&access, true).unwrap();
+	let ticket = prepare(&access, true).await.unwrap();
 	Arc::make_mut(&mut access.config).pipeline.policies.push(
 		serde_json::from_value(json!({
 			"id":"revoke-resource", "enabled":true,"effect":"deny","resourceType":"mcpResource"
 		}))
 		.unwrap(),
 	);
-	assert!(ticket.commit(&access).is_err());
-	assert!(notification(&access, "docs", &update()).is_err());
+	assert!(ticket.commit(&access).await.is_err());
+	assert!(notification(&access, "docs", &update()).await.is_err());
 	drop(ticket);
 	assert!(
 		access
@@ -70,15 +76,15 @@ fn failed_or_abandoned_subscribe_releases_capacity() {
 	);
 }
 
-#[test]
-fn legacy_constraint_is_rechecked_before_subscription_commit_and_update() {
+#[tokio::test]
+async fn legacy_constraint_is_rechecked_before_subscription_commit_and_update() {
 	let mut access = super::super::tests::access();
-	let ticket = prepare(&access, true).unwrap();
+	let ticket = prepare(&access, true).await.unwrap();
 	let legacy: security_pipeline::SecurityPipelineConfig = serde_json::from_value(
 		json!({"policies":[{"id":"deny","effect":"deny","enabled":true,"resourceType":"mcpResource"}]}),
 	)
 	.unwrap();
 	access.legacy = Some(legacy.into());
-	assert!(ticket.commit(&access).is_err());
-	assert!(notification(&access, "docs", &update()).is_err());
+	assert!(ticket.commit(&access).await.is_err());
+	assert!(notification(&access, "docs", &update()).await.is_err());
 }

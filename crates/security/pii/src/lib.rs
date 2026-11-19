@@ -47,6 +47,10 @@ pub struct PiiFinding {
 
 #[async_trait::async_trait]
 pub trait PiiDetector: Send + Sync {
+	/// Initialize detector resources before readiness, outside the per-request time budget.
+	async fn prepare(&self) -> Result<(), PiiError> {
+		Ok(())
+	}
 	async fn detect(&self, text: &str, language: &str) -> Result<Vec<PiiFinding>, PiiError>;
 }
 
@@ -130,6 +134,7 @@ impl PiiEngine {
 		self.config.max_findings
 	}
 	pub async fn check_ready(&self) -> Result<(), PiiError> {
+		self.detector.prepare().await?;
 		let text = "gateway PII readiness check";
 		let findings = self.detect(text).await?;
 		self.normalize(text, findings)?;
@@ -139,12 +144,17 @@ impl PiiEngine {
 		if text.len() > self.config.max_text_bytes {
 			return Err(PiiError::InputLimit);
 		}
-		tokio::time::timeout(
-			Duration::from_millis(self.config.timeout_ms),
-			self.detector.detect(text, &self.config.language),
-		)
-		.await
-		.map_err(|_| PiiError::Timeout)?
+		let deadline = tokio::time::Instant::now() + Duration::from_millis(self.config.timeout_ms);
+		let result =
+			tokio::time::timeout_at(deadline, self.detector.detect(text, &self.config.language))
+				.await
+				.unwrap_or(Err(PiiError::Timeout));
+		// A detector may finish synchronously without giving the timer a chance to poll.
+		if tokio::time::Instant::now() >= deadline {
+			Err(PiiError::Timeout)
+		} else {
+			result
+		}
 	}
 	fn normalize(
 		&self,
@@ -187,23 +197,26 @@ impl PiiEngine {
 				detector_error: None,
 			});
 		}
-		let findings = match self
-			.detect(text)
-			.await
-			.and_then(|v| self.normalize(text, v))
-		{
-			Ok(findings) => findings,
-			Err(error) if self.config.mode != PiiMode::Enforce => {
-				return Ok(PiiOutcome {
-					text: text.into(),
-					findings: vec![],
-					modified: false,
-					blocked: false,
-					detector_error: Some(error),
-				});
-			},
-			Err(error) => return Err(error),
+		let deadline = tokio::time::Instant::now() + Duration::from_millis(self.config.timeout_ms);
+		let result = self.inspect_active(text).await;
+		let result = if tokio::time::Instant::now() >= deadline {
+			Err(PiiError::Timeout)
+		} else {
+			result
 		};
+		match result {
+			Err(error) if self.config.mode != PiiMode::Enforce => Ok(PiiOutcome {
+				text: text.into(),
+				findings: vec![],
+				modified: false,
+				blocked: false,
+				detector_error: Some(error),
+			}),
+			result => result,
+		}
+	}
+	async fn inspect_active(&self, text: &str) -> Result<PiiOutcome, PiiError> {
+		let findings = self.normalize(text, self.detect(text).await?)?;
 		if self.config.mode != PiiMode::Enforce {
 			return Ok(PiiOutcome {
 				text: text.into(),

@@ -62,7 +62,7 @@ pub(super) fn reserve_result(
 	Ok(())
 }
 impl Link {
-	pub(crate) fn attach(
+	pub(crate) async fn attach(
 		ticket: &Ticket,
 		access: &SessionAccess,
 		server: &str,
@@ -82,7 +82,7 @@ impl Link {
 		if server != link.ticket.record.server {
 			return Err(access.denial("task-interaction-inactive"));
 		}
-		link.ticket.check(access)?;
+		link.ticket.check(access).await?;
 		if !link.answerable() {
 			return Ok(None);
 		} // Terminal result reads are still ordinary Task reads.
@@ -111,7 +111,7 @@ impl Link {
 					.is_some_and(|s| matches!(s.status, TaskStatus::Working | TaskStatus::InputRequired))
 			})
 	}
-	pub(crate) fn check(
+	pub(crate) async fn check(
 		&self,
 		access: &SessionAccess,
 		method: &str,
@@ -141,7 +141,7 @@ impl Link {
 		if !self.answerable() || !enabled {
 			return Err(access.denial("task-interaction-inactive"));
 		}
-		self.ticket.check(access)?;
+		self.ticket.check(access).await?;
 		let action = operation(
 			access,
 			&format!("{method}/{phase}"),
@@ -154,12 +154,16 @@ impl Link {
 			.map_err(|_| access.denial("task-interaction-authorization"))?;
 		if let Some(guards) = &self.ticket.record.guards {
 			guards.check_mcp_elicitation_approval(&self.ticket.record.business)?;
-			guards.authorize_mcp_task(&access.config, &[&action])?;
+			guards
+				.authorize_mcp_task(&access.config, &[&action])
+				.await?;
 		}
 		if let Some(flow) = &access.flow {
-			flow.check(&action, &self.ticket.record.server)?;
+			flow
+				.check_async(&action, &self.ticket.record.server)
+				.await?;
 		}
-		self.ticket.check(access)?;
+		self.ticket.check(access).await?;
 		if !self.answerable() {
 			return Err(access.denial("task-interaction-inactive"));
 		}
@@ -176,7 +180,7 @@ impl Link {
 		self.ticket.record.guards.clone()
 	}
 	#[cfg(feature = "gateway-llm")]
-	pub(crate) fn correlate_model(
+	pub(crate) async fn correlate_model(
 		&self,
 		access: &SessionAccess,
 		request_id: String,
@@ -193,7 +197,9 @@ impl Link {
 			.authorize(&action, None)
 			.map_err(|_| access.denial("task-sampling-model-correlation"))?;
 		if let Some(guards) = &self.ticket.record.guards {
-			guards.authorize_mcp_task(&access.config, &[&action])?;
+			guards
+				.authorize_mcp_task(&access.config, &[&action])
+				.await?;
 		}
 		Ok(())
 	}

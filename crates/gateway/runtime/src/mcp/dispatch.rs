@@ -31,13 +31,7 @@ pub(crate) fn current<B>(request: &::http::Request<B>) -> Result<(), ProxyError>
 		.extensions()
 		.get::<super::session_security::SessionAccess>()
 	{
-		access.current()?;
-	}
-	if let Some(flow) = request
-		.extensions()
-		.get::<crate::security_flow::FlowAccess>()
-	{
-		flow.current()?;
+		access.current_local()?;
 	}
 	if let Some(error) = request
 		.extensions()
@@ -49,6 +43,24 @@ pub(crate) fn current<B>(request: &::http::Request<B>) -> Result<(), ProxyError>
 	Ok(())
 }
 
+/// Confirm persistent Context checks, then recheck local credentials/configuration after the wait.
+pub(crate) async fn current_async(request: &::http::Request<()>) -> Result<(), ProxyError> {
+	current(request)?;
+	if let Some(access) = request
+		.extensions()
+		.get::<super::session_security::SessionAccess>()
+	{
+		access.current().await?;
+	}
+	if let Some(flow) = request
+		.extensions()
+		.get::<crate::security_flow::FlowAccess>()
+	{
+		flow.current_async().await?;
+	}
+	current(request)
+}
+
 /// Stop waiting on remote authorization when the trusted request lifecycle ends. The worker
 /// retains its admission slot until completion; no result is published from this future on error.
 pub(crate) async fn authorize<T>(
@@ -56,7 +68,7 @@ pub(crate) async fn authorize<T>(
 	action: &security_types::ActionRequest,
 	future: impl std::future::Future<Output = Result<T, security_pipeline::GatewayError>>,
 ) -> Result<Result<T, security_pipeline::GatewayError>, ProxyError> {
-	current(&request).inspect_err(|_| {
+	current_async(&request).await.inspect_err(|_| {
 		super::session_security::deny(action, "request-lifecycle");
 	})?;
 	let mut revision = request
@@ -105,7 +117,7 @@ pub(crate) async fn authorize<T>(
 		_ = changed => Err(super::session_security::deny(action, "config-changed")),
 		_ = expired => Err(super::session_security::deny(action, "credential-expired")),
 		result = work => {
-			current(&request).inspect_err(|_| { super::session_security::deny(action, "request-lifecycle"); })?;
+			current_async(&request).await.inspect_err(|_| { super::session_security::deny(action, "request-lifecycle"); })?;
 			result
 		}
 	}
@@ -151,4 +163,43 @@ pub(crate) fn before_send(request: &Request) -> Result<(), ProxyError> {
 		call.before_send()?;
 	}
 	Ok(())
+}
+
+/// Reauthorize the originating protected operation after all transport preparation waits.
+/// `before_send` immediately follows with local expiry/cancellation and one-send claims.
+pub(crate) async fn authorize_send(request: &::http::Request<()>) -> Result<(), ProxyError> {
+	current_async(request).await?;
+	if let Some(access) = request
+		.extensions()
+		.get::<super::session_security::SessionAccess>()
+	{
+		if let Some(ticket) = request.extensions().get::<Ticket>() {
+			ticket.check(access).await?;
+		}
+		if let Some(ticket) = request.extensions().get::<ResponseTicket>() {
+			ticket.check(access).await?;
+		}
+	}
+	#[cfg(feature = "gateway-llm")]
+	if let Some(call) = request.extensions().get::<ModelCall>() {
+		call.authorize_send().await?;
+	}
+	if let Some(flow) = request
+		.extensions()
+		.get::<crate::security_flow::FlowAccess>()
+		&& flow.restricts_untrusted_payloads()
+		&& let Some(egress) = request.extensions().get::<super::McpEgressContext>()
+	{
+		if !egress.supported {
+			return Err(ProxyError::AuthorizationFailed);
+		}
+		let destination = if egress.action.action.action_type == security_types::ActionType::ToolInvoke
+		{
+			format!("{}/{}", egress.server, egress.action.resource.id)
+		} else {
+			egress.server.clone()
+		};
+		flow.check_async(&egress.action, &destination).await?;
+	}
+	current(request)
 }

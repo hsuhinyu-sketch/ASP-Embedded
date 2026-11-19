@@ -1,7 +1,7 @@
 //! Immutable model selection data. A selection carries no execution authority.
 pub mod path;
 
-use rand::seq::IndexedRandom;
+use rand::distr::{Distribution, weighted::WeightedIndex};
 use serde::Serialize;
 
 #[derive(
@@ -52,7 +52,15 @@ pub struct ConditionalTarget {
 #[derive(Debug, Clone)]
 pub struct RoutingTable {
 	models: Vec<ModelRoute>,
-	virtual_models: Vec<VirtualModelRoute>,
+	virtual_models: Vec<PreparedVirtualModel>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedVirtualModel {
+	route: VirtualModelRoute,
+	// Derived once from this immutable snapshot. Invalid declarations keep their original
+	// selection error; preparing an unused alias must not change when that error is returned.
+	weights: Option<Result<WeightedIndex<usize>, rand::distr::weighted::Error>>,
 }
 
 // Borrowed IDs cannot outlive their table. Index lookup also rejects another snapshot,
@@ -88,7 +96,18 @@ impl RoutingTable {
 	pub fn new(models: Vec<ModelRoute>, virtual_models: Vec<VirtualModelRoute>) -> Self {
 		Self {
 			models,
-			virtual_models,
+			virtual_models: virtual_models
+				.into_iter()
+				.map(|route| {
+					let weights = match &route.routing {
+						VirtualModelRouting::Weighted(targets) => Some(WeightedIndex::new(
+							targets.iter().map(|target| target.weight),
+						)),
+						_ => None,
+					};
+					PreparedVirtualModel { route, weights }
+				})
+				.collect(),
 		}
 	}
 	pub fn models(&self) -> impl ExactSizeIterator<Item = (ModelId<'_>, &ModelRoute)> {
@@ -105,7 +124,7 @@ impl RoutingTable {
 			.virtual_models
 			.iter()
 			.enumerate()
-			.map(|(index, model)| (VirtualModelId { table: self, index }, model))
+			.map(|(index, model)| (VirtualModelId { table: self, index }, &model.route))
 	}
 	pub fn model_index(&self, id: ModelId<'_>) -> Option<usize> {
 		std::ptr::eq(self, id.table).then_some(id.index)
@@ -140,7 +159,12 @@ impl RoutingTable {
 			.models()
 			.filter(|(id, model)| model.visibility.is_public() && visible(*id))
 			.map(|(_, model)| model.name.as_str())
-			.chain(self.virtual_models.iter().map(|model| model.name.as_str()))
+			.chain(
+				self
+					.virtual_models
+					.iter()
+					.map(|model| model.route.name.as_str()),
+			)
 			.collect()
 	}
 	/// Conditions and randomness are requested lazily. No network, request, policy or
@@ -154,9 +178,13 @@ impl RoutingTable {
 		let index = self
 			.virtual_model_index(id)
 			.ok_or(SelectionError::ForeignSnapshot)?;
-		match &self.virtual_models[index].routing {
+		let prepared = &self.virtual_models[index];
+		match &prepared.route.routing {
 			VirtualModelRouting::Weighted(targets) => {
-				let target = targets.choose_weighted(&mut rng(), |target| target.weight)?;
+				let mut rng = rng();
+				let weights = prepared.weights.as_ref().expect("weighted route prepared");
+				let distribution = weights.as_ref().map_err(|error| *error)?;
+				let target = &targets[distribution.sample(&mut rng)];
 				Ok(VirtualTarget::Model(&target.model))
 			},
 			VirtualModelRouting::Conditional(targets) => targets

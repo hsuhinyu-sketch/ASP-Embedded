@@ -15,12 +15,13 @@ INDEX = DOCS / "documentation-index.md"
 START = "<!-- DOC-INDEX:START -->"
 END = "<!-- DOC-INDEX:END -->"
 ROLES = {
-    "entrypoint", "handoff", "active-plan", "reference", "gate", "changelog",
+    "entrypoint", "developer-guide", "handoff", "active-plan", "reference", "gate", "changelog",
     "implementation-record", "historical-plan", "historical-record",
     "vendor-reference", "index",
 }
 AUTHORITIES = {
     "entrypoint": DOCS / "README.md",
+    "developer-guide": DOCS / "DEV.md",
     "handoff": DOCS / "HANDOFF.md",
     "active-plan": DOCS / "architecture/componentization-plan.md",
     "gate": DOCS / "architecture/production-stability-risks.md",
@@ -131,7 +132,7 @@ def check_public():
     paths = sorted({ROOT / name for name in result.stdout.split("\0") if name})
     available = {path.resolve() for path in paths if path.is_file()}
     errors, links = [], 0
-    for name in ("README.md", "architecture/README.md", "reference/configuration-guide.md", "release/README.md"):
+    for name in ("README.md", "DEV.md", "architecture/README.md", "reference/configuration-guide.md", "release/README.md"):
         if (DOCS / name).resolve() not in available:
             errors.append(f"missing public documentation: docs/{name}")
     for path in paths:
@@ -142,8 +143,11 @@ def check_public():
             continue
         content = path.read_text(encoding="utf-8")
         markers = ROLE.findall(content)
-        if len(markers) != 1 or markers[0] not in {"entrypoint", "reference", "vendor-reference", "changelog"}:
+        if (len(markers) != 1
+                or markers[0] not in {"entrypoint", "developer-guide", "reference", "vendor-reference", "changelog"}):
             errors.append(f"{path.relative_to(ROOT)}: expected a public documentation role")
+        if ("developer-guide" in markers) != (path == AUTHORITIES["developer-guide"]):
+            errors.append(f"{path.relative_to(ROOT)}: docs/DEV.md owns the developer-guide role")
         for number, target in local_links(content):
             links += 1
             destination = (path.parent / target).resolve()
@@ -191,9 +195,8 @@ def main():
             if not (path.parent / target).exists():
                 errors.append(f"{path.relative_to(ROOT)}:{number}: missing target {target}")
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8") if (ROOT / "AGENTS.md").is_file() else ""
-    for target in ("docs/README.md", "docs/HANDOFF.md"):
-        if target not in {target for _, target in local_links(agents)}:
-            errors.append(f"AGENTS.md: missing entry link to {target}")
+    if "docs/DEV.md" not in {target for _, target in local_links(agents)}:
+        errors.append("AGENTS.md: missing entry link to docs/DEV.md")
     if errors:
         for error in errors:
             print(f"ERROR: {error}")

@@ -43,13 +43,20 @@ fn register_owner(owner: &Arc<SessionBinding>) -> Result<(), UpstreamError> {
 		.get_or_init(Default::default)
 		.lock()
 		.map_err(|_| UpstreamError::InvalidRequest("task owner registry unavailable".into()))?;
-	if !owners.iter().any(|o| o.ptr_eq(&Arc::downgrade(owner))) {
+	let weak = Arc::downgrade(owner);
+	if !owners.iter().any(|o| o.ptr_eq(&weak)) {
+		if owners.len() >= 1024 {
+			owners.retain(|o| {
+				o.upgrade()
+					.is_some_and(|b| b.tasks.try_lock().map_or(true, |r| !r.records.is_empty()))
+			});
+		}
 		if owners.len() >= 1024 {
 			return Err(UpstreamError::InvalidRequest(
 				"task owner registry capacity".into(),
 			));
 		}
-		owners.push(Arc::downgrade(owner));
+		owners.push(weak);
 	}
 	Ok(())
 }
@@ -123,8 +130,8 @@ fn access(ctx: &IncomingRequestContext) -> Result<SessionAccess, UpstreamError> 
 			UpstreamError::InvalidRequest("async Task requires a protected live session".into())
 		})
 }
-fn binding(access: &SessionAccess) -> Result<&Arc<SessionBinding>, ProxyError> {
-	access.check()?;
+async fn binding(access: &SessionAccess) -> Result<&Arc<SessionBinding>, ProxyError> {
+	access.check().await?;
 	if access.limits.tasks.is_none() {
 		return Err(access.denial("task-unadapted-combination"));
 	}
@@ -133,7 +140,7 @@ fn binding(access: &SessionAccess) -> Result<&Arc<SessionBinding>, ProxyError> {
 		.as_ref()
 		.ok_or_else(|| access.denial("task-requires-session"))
 }
-pub(crate) fn observe_initialize(
+pub(crate) async fn observe_initialize(
 	access: &SessionAccess,
 	server: &str,
 	init: &rmcp::model::InitializeResult,
@@ -141,7 +148,7 @@ pub(crate) fn observe_initialize(
 	if access.limits.tasks.is_none() {
 		return Ok(());
 	}
-	let binding = binding(access)?;
+	let binding = binding(access).await?;
 	let cap =
 		serde_json::to_value(&init.capabilities).map_err(|_| access.denial("task-capabilities"))?;
 	let supported = init.protocol_version.as_str() == "2025-11-25"
@@ -171,7 +178,7 @@ pub(crate) fn capabilities(access: &SessionAccess, cap: &mut rmcp::model::Server
 		cap.tasks = serde_json::from_value(value).ok();
 	}
 }
-pub(crate) fn observe_tools(
+pub(crate) async fn observe_tools(
 	access: &SessionAccess,
 	server: &str,
 	list: &mut rmcp::model::ListToolsResult,
@@ -185,7 +192,7 @@ pub(crate) fn observe_tools(
 		}
 		return Ok(());
 	};
-	let binding = binding(access)?;
+	let binding = binding(access).await?;
 	let mut registry = binding
 		.tasks
 		.lock()
@@ -244,7 +251,7 @@ impl Ticket {
 			.get::<SessionAccess>()
 			.cloned()
 			.ok_or(ProxyError::AuthorizationFailed)?;
-		self.check(&access)?;
+		self.check(&access).await?;
 		let rpc: Value = crate::json::inspect_body(request)
 			.await
 			.map_err(|_| access.denial("task-dispatch"))?;
@@ -279,7 +286,7 @@ impl Ticket {
 		{
 			return Err(access.denial("task-dispatch"));
 		}
-		self.check(&access)
+		self.check(&access).await
 	}
 	fn check_execution(&self, access: &SessionAccess) -> Result<(), ProxyError> {
 		if let Some(cleanup) = &self.cleanup {
@@ -312,8 +319,8 @@ impl Ticket {
 		}
 		Ok(())
 	}
-	pub(super) fn check(&self, access: &SessionAccess) -> Result<(), ProxyError> {
-		let binding = binding(access)?;
+	pub(crate) async fn check(&self, access: &SessionAccess) -> Result<(), ProxyError> {
+		let binding = binding(access).await?;
 		self.check_execution(access)?;
 		if self.record.expired()
 			|| (self.record.cancel.load(Ordering::Acquire) && self.method == "tasks/result")
@@ -334,9 +341,9 @@ impl Ticket {
 			}
 		}
 		let action = operation(access, &self.method, &self.record.server, &self.record.id);
-		access
-			.security()
-			.authorize(&action, None)
+		// Bound the nested transport future: authorization owns its request snapshot.
+		Box::pin(access.security().authorize_async(&action, None))
+			.await
 			.map_err(|_| access.denial("task-authorization"))?;
 		let transport = security_pipeline::mcp_operation_for_identity(
 			&access.action.request_id,
@@ -346,16 +353,18 @@ impl Ticket {
 			&self.record.server,
 		);
 		if self.method != "tools/call" {
-			access
-				.security()
-				.authorize(&transport, None)
+			Box::pin(access.security().authorize_async(&transport, None))
+				.await
 				.map_err(|_| access.denial("task-transport-authorization"))?;
 		}
 		if self.cleanup.is_none() {
-			access
-				.security()
-				.authorize(&self.record.business, Some(&self.record.arguments))
-				.map_err(|_| access.denial("task-business-authorization"))?;
+			Box::pin(
+				access
+					.security()
+					.authorize_async(&self.record.business, Some(&self.record.arguments)),
+			)
+			.await
+			.map_err(|_| access.denial("task-business-authorization"))?;
 			let cel = super::super::rbac::CelExecWrapper::new((*access.authorization_request).clone());
 			if !access.policies.validate(
 				&super::super::rbac::ResourceType::Tool(super::super::rbac::ResourceId::new(
@@ -369,22 +378,28 @@ impl Ticket {
 		}
 		if let Some(flow) = &access.flow {
 			if self.cleanup.is_some() {
-				flow.check(&action, &self.record.server)?;
+				flow.check_async(&action, &self.record.server).await?;
 			} else {
-				flow.check(
-					&self.record.business,
-					&format!("{}/{}", self.record.server, self.record.tool),
-				)?;
+				flow
+					.check_async(
+						&self.record.business,
+						&format!("{}/{}", self.record.server, self.record.tool),
+					)
+					.await?;
 			}
 		}
 		if let Some(guards) = &self.record.guards {
 			if let Some(cleanup) = &self.cleanup {
-				guards.authorize_mcp_task(&access.config, &[&action, &transport, cleanup.action()])?;
+				guards
+					.authorize_mcp_task(&access.config, &[&action, &transport, cleanup.action()])
+					.await?;
 			} else {
-				guards.authorize_mcp_task(&access.config, &[&self.record.business, &action])?;
+				guards
+					.authorize_mcp_task(&access.config, &[&self.record.business, &action])
+					.await?;
 			}
 		}
-		access.check()?;
+		access.check().await?;
 		self.check_execution(access)?;
 		if self.record.expired()
 			|| (self.record.cancel.load(Ordering::Acquire) && self.method == "tasks/result")
@@ -393,31 +408,31 @@ impl Ticket {
 		}
 		Ok(())
 	}
-	pub(super) fn response(
+	pub(super) async fn response(
 		&self,
 		access: &SessionAccess,
 		result: &mut ServerResult,
 	) -> Result<(), ProxyError> {
-		self.check(access)?;
+		self.check(access).await?;
 		match (self.method.as_str(), result) {
 			("tools/call", ServerResult::CreateTaskResult(created)) => {
-				self.update(access, &mut created.task, true)?;
+				self.update(access, &mut created.task, true).await?;
 				created.meta = None;
-				self.check(access)?;
+				self.check(access).await?;
 				if let Some(proof) = self.record.budget.get() {
 					proof.accept_task(&self.record.id)?;
 				}
 				self.record.accepted.store(true, Ordering::Release);
 			},
 			("tasks/get", ServerResult::GetTaskResult(task)) => {
-				self.update(access, &mut task.task, false)?;
+				self.update(access, &mut task.task, false).await?;
 				task.meta = None;
 			},
 			("tasks/cancel", ServerResult::CancelTaskResult(task)) => {
 				if task.task.status != TaskStatus::Cancelled {
 					return Err(access.denial("task-cancel-not-confirmed"));
 				}
-				self.update(access, &mut task.task, false)?;
+				self.update(access, &mut task.task, false).await?;
 				task.meta = None;
 				if let Some(proof) = self.record.budget.get() {
 					proof.abandon_task();
@@ -431,7 +446,7 @@ impl Ticket {
 				if task.task.status != TaskStatus::Cancelled {
 					return Err(access.denial("task-cancel-not-confirmed"));
 				}
-				self.update(access, &mut task.task, false)?;
+				self.update(access, &mut task.task, false).await?;
 				task.meta = None;
 				if let Some(proof) = self.record.budget.get() {
 					proof.abandon_task();
@@ -497,9 +512,9 @@ impl Ticket {
 			},
 			_ => return Err(access.denial("task-response-shape")),
 		}
-		self.check(access)
+		self.check(access).await
 	}
-	fn update(
+	async fn update(
 		&self,
 		access: &SessionAccess,
 		task: &mut Task,
@@ -534,7 +549,7 @@ impl Ticket {
 		{
 			return Err(access.denial("task-time-or-id"));
 		}
-		let binding = binding(access)?;
+		let binding = binding(access).await?;
 		if create {
 			let registry = binding
 				.tasks
@@ -656,12 +671,12 @@ pub(crate) fn hold_admission(stream: Messages, admission: Option<Admission>) -> 
 		item
 	}))
 }
-pub(crate) fn route(
+pub(crate) async fn route(
 	request: &mut JsonRpcRequest<ClientRequest>,
 	ctx: &mut IncomingRequestContext,
 ) -> Result<String, UpstreamError> {
 	let access = access(ctx)?;
-	let binding = binding(&access)?;
+	let binding = binding(&access).await?;
 	let mut value = serde_json::to_value(&*request).map_err(|_| fail(&access, "task-request"))?;
 	let params = value["params"]
 		.as_object_mut()
@@ -698,7 +713,7 @@ pub(crate) fn route(
 		method: request.request.method().to_string(),
 		requested_ttl: access.limits.tasks.as_ref().unwrap().max_task_seconds * 1000,
 	};
-	ticket.check(&access)?;
+	ticket.check(&access).await?;
 	interaction::reserve_result(&mut ticket, &access, ctx)?;
 	if ticket.method == "tasks/cancel" {
 		if ticket.record.cancel_sent.load(Ordering::Acquire) {
@@ -767,7 +782,7 @@ pub(crate) fn route(
 	ctx.extensions_mut().insert(ticket);
 	Ok(server)
 }
-pub(crate) fn prepare(
+pub(crate) async fn prepare(
 	request: &JsonRpcRequest<ClientRequest>,
 	ctx: &mut IncomingRequestContext,
 	server: &str,
@@ -805,7 +820,7 @@ pub(crate) fn prepare(
 		return Ok(None);
 	}
 	let access = access(ctx)?;
-	let binding = binding(&access)?;
+	let binding = binding(&access).await?;
 	if guardrails {
 		return Err(fail(&access, "task-external-guardrails-unadapted"));
 	}
@@ -828,67 +843,71 @@ pub(crate) fn prepare(
 	if requested == 0 || requested > limits.max_task_seconds * 1000 {
 		return Err(fail(&access, "task-ttl"));
 	}
-	prune_owners()?;
-	let mut registry = binding
-		.tasks
-		.lock()
-		.map_err(|_| fail(&access, "task-store"))?;
-	registry.records.retain(|_, r| !r.expired());
-	if !registry.source.as_ref().is_some_and(|s| s.0 == server)
-		|| !registry.tools.contains_key(call.params.name.as_ref())
-	{
-		return Err(fail(&access, "task-not-negotiated"));
+	// Other sessions need reclaiming only when their slots prevent admission.
+	let global = GLOBAL.get_or_init(Default::default);
+	if global.load(Ordering::Acquire) >= 1024 {
+		prune_owners()?;
 	}
-	if registry.records.len() >= limits.max_tasks
-		|| registry
-			.records
-			.values()
-			.any(|r| r.rpc == request.id.to_string())
-	{
-		return Err(fail(&access, "task-capacity-or-duplicate"));
-	}
-	let slot = reserve(GLOBAL.get_or_init(Default::default), 1024)
-		.ok_or_else(|| fail(&access, "task-global-capacity"))?;
-	let id = uuid::Uuid::new_v4().to_string();
-	let record = Arc::new(Record {
-		interaction_active: AtomicBool::new(false),
-		interaction_ids: Mutex::new(Default::default()),
-		execution: ctx
-			.as_request()
-			.extensions()
-			.get::<crate::execution_budget::ExecutionScope>()
-			.cloned(),
-		budget: OnceLock::new(),
-		accepted: AtomicBool::new(false),
-		task_metadata: serde_json::to_value(&call.params.task)
-			.map_err(|_| fail(&access, "task-metadata"))?,
-		id: id.clone(),
-		server: server.into(),
-		rpc: request.id.to_string(),
-		tool: call.params.name.to_string(),
-		arguments: args,
-		business: security_pipeline::tool_invoke_for_identity(
-			&access.action.request_id,
-			access.identity.clone(),
-			call.params.name.to_string(),
-		),
-		guards: ctx
-			.as_request()
-			.extensions()
-			.get::<crate::proxy::RoutingGuards>()
-			.cloned(),
-		expires: Instant::now() + Duration::from_millis(requested),
-		credential_expires: access.expires,
-		upstream: OnceLock::new(),
-		peer_deadline: OnceLock::new(),
-		snapshot: Mutex::new(None),
-		receipt: Mutex::new(None),
-		cancel: AtomicBool::new(false),
-		cancel_sent: AtomicBool::new(false),
-		_slot: slot,
-	});
-	registry.records.insert(id, record.clone());
-	drop(registry);
+	let record = {
+		let mut registry = binding
+			.tasks
+			.lock()
+			.map_err(|_| fail(&access, "task-store"))?;
+		registry.records.retain(|_, r| !r.expired());
+		if !registry.source.as_ref().is_some_and(|s| s.0 == server)
+			|| !registry.tools.contains_key(call.params.name.as_ref())
+		{
+			return Err(fail(&access, "task-not-negotiated"));
+		}
+		if registry.records.len() >= limits.max_tasks {
+			return Err(fail(&access, "task-capacity-or-duplicate"));
+		}
+		let rpc = request.id.to_string();
+		if registry.records.values().any(|r| r.rpc == rpc) {
+			return Err(fail(&access, "task-capacity-or-duplicate"));
+		}
+		let slot = reserve(global, 1024).ok_or_else(|| fail(&access, "task-global-capacity"))?;
+		let id = uuid::Uuid::new_v4().to_string();
+		let record = Arc::new(Record {
+			interaction_active: AtomicBool::new(false),
+			interaction_ids: Mutex::new(Default::default()),
+			execution: ctx
+				.as_request()
+				.extensions()
+				.get::<crate::execution_budget::ExecutionScope>()
+				.cloned(),
+			budget: OnceLock::new(),
+			accepted: AtomicBool::new(false),
+			task_metadata: serde_json::to_value(&call.params.task)
+				.map_err(|_| fail(&access, "task-metadata"))?,
+			id: id.clone(),
+			server: server.into(),
+			rpc,
+			tool: call.params.name.to_string(),
+			arguments: args,
+			business: security_pipeline::tool_invoke_for_identity(
+				&access.action.request_id,
+				access.identity.clone(),
+				call.params.name.to_string(),
+			),
+			guards: ctx
+				.as_request()
+				.extensions()
+				.get::<crate::proxy::RoutingGuards>()
+				.cloned(),
+			expires: Instant::now() + Duration::from_millis(requested),
+			credential_expires: access.expires,
+			upstream: OnceLock::new(),
+			peer_deadline: OnceLock::new(),
+			snapshot: Mutex::new(None),
+			receipt: Mutex::new(None),
+			cancel: AtomicBool::new(false),
+			cancel_sent: AtomicBool::new(false),
+			_slot: slot,
+		});
+		registry.records.insert(id, record.clone());
+		record
+	};
 	let ticket = Ticket {
 		interaction: std::sync::Weak::new(),
 		cleanup: None,
@@ -905,6 +924,7 @@ pub(crate) fn prepare(
 	admission
 		.ticket
 		.check(&access)
+		.await
 		.map_err(UpstreamError::Proxy)?;
 	ctx.extensions_mut().insert(admission.ticket.clone());
 	Ok(Some(admission))

@@ -18,7 +18,7 @@ pub(super) fn io_slot() -> Result<tokio::sync::OwnedSemaphorePermit, ObjectError
 
 impl AuthorizedCall {
 	pub(super) async fn commit_push_event(self: &Arc<Self>, result: Value) -> Result<(), ProxyError> {
-		self.check_continuation()?;
+		self.check_continuation().await?;
 		let objects = self.config.a2a_objects.as_ref().expect("enabled");
 		let limits = objects
 			.event_recovery
@@ -46,7 +46,7 @@ impl AuthorizedCall {
 					.map_err(|e| deny(&self.action, e))
 			})
 			.await?;
-		self.check_continuation()
+		self.check_continuation().await
 	}
 	async fn wait_event_io<T>(
 		&self,
@@ -81,7 +81,7 @@ impl AuthorizedCall {
 			guarded.await
 		}
 	}
-	pub(super) fn check_continuation(&self) -> Result<(), ProxyError> {
+	pub(super) async fn check_continuation(&self) -> Result<(), ProxyError> {
 		self.check_credential().map_err(|e| self.stream_denial(e))?;
 		self
 			.config
@@ -98,7 +98,7 @@ impl AuthorizedCall {
 			return Err(deny(&self.action, ObjectError::StreamAuthorization));
 		}
 		if let Some(flow) = &self.flow {
-			flow.current()?;
+			flow.current_async().await?;
 		}
 		let mut actions = vec![&self.invocation, &self.action];
 		let read = self.permit.task_id.as_ref().map(|id| {
@@ -120,6 +120,7 @@ impl AuthorizedCall {
 		if let Some(guards) = &self.download_guards {
 			guards
 				.authorize_a2a_continuation(&self.config, &actions)
+				.await
 				.map_err(|_| deny(&self.action, ObjectError::StreamAuthorization))?;
 		}
 		self.check_credential().map_err(|e| self.stream_denial(e))?;
@@ -156,7 +157,7 @@ impl AuthorizedCall {
 		else {
 			return Ok(None);
 		};
-		self.check_continuation()?;
+		self.check_continuation().await?;
 		let store = settings.store().map_err(|e| deny(&self.action, e))?;
 		security_audit::StateJournal::encoded_len(result, settings.max_event_bytes)
 			.map_err(|_| deny(&self.action, ObjectError::EventStorage))?;
@@ -175,7 +176,7 @@ impl AuthorizedCall {
 					.map_err(|e| deny(&self.action, e))
 			})
 			.await?;
-		self.check_continuation()?;
+		self.check_continuation().await?;
 		Ok(Some(cursor))
 	}
 	fn artifact_visible(&self, id: &str) -> bool {
@@ -191,10 +192,10 @@ impl AuthorizedCall {
 			),
 		);
 		crate::security::evaluate(&self.config, &action).is_ok()
-			&& self.download_guards.as_ref().is_none_or(|g| {
-				g.authorize_a2a_continuation(&self.config, &[&action])
-					.is_ok()
-			})
+			&& self
+				.download_guards
+				.as_ref()
+				.is_none_or(|g| g.artifact_visible(&self.config, &action))
 	}
 	pub(super) fn project_event(&self, result: Option<&mut Value>) -> Result<bool, ProxyError> {
 		gateway_a2a::recovery::project_event(result, |id| self.artifact_visible(id))
@@ -206,14 +207,16 @@ impl AuthorizedCall {
 		let Some((after, limit)) = &self.recovery else {
 			return Ok(None);
 		};
-		self.check_continuation()?;
+		self.check_continuation().await?;
 		let mut recovery = self.action.clone();
 		recovery.action.action_type = ActionType::AgentEventRecover;
 		recovery.action.name = "read".into();
 		crate::security::evaluate(&self.config, &recovery)
 			.map_err(|_| deny(&recovery, ObjectError::StreamAuthorization))?;
 		if let Some(guards) = &self.download_guards {
-			guards.authorize_a2a_continuation(&self.config, &[&recovery])?;
+			guards
+				.authorize_a2a_continuation(&self.config, &[&recovery])
+				.await?;
 		}
 		let objects = self.config.a2a_objects.as_ref().expect("enabled");
 		let _read_lease = self
@@ -256,7 +259,7 @@ impl AuthorizedCall {
 			|id| self.artifact_visible(id),
 		)
 		.map_err(|e| deny(&self.action, object_error(e)))?;
-		self.check_continuation()?;
+		self.check_continuation().await?;
 		self
 			.config
 			.a2a_task_store
@@ -265,7 +268,9 @@ impl AuthorizedCall {
 		crate::security::evaluate(&self.config, &recovery)
 			.map_err(|_| deny(&recovery, ObjectError::StreamAuthorization))?;
 		if let Some(guards) = &self.download_guards {
-			guards.authorize_a2a_continuation(&self.config, &[&recovery])?;
+			guards
+				.authorize_a2a_continuation(&self.config, &[&recovery])
+				.await?;
 		}
 		let body =
 			gateway_a2a::recovery::response(&self.rpc_id, events, batch.next_cursor, batch.has_more);

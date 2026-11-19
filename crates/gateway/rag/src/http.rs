@@ -35,6 +35,13 @@ pub struct VerifiedGatewayIdentity(pub GatewayIdentity);
 /// Trusted host hook, installed only after JWT verification. Request JSON cannot supply it.
 pub trait ContextConstraintIssuer: Send + Sync {
 	fn issue(&self, context: &GuardedContext, parent: Option<&str>) -> Result<String, String>;
+	fn issue_async<'a>(
+		&'a self,
+		context: &'a GuardedContext,
+		parent: Option<&'a str>,
+	) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>> {
+		Box::pin(async move { self.issue(context, parent) })
+	}
 	/// The trusted host must separately authorize lifecycle operations. Default is deny.
 	fn revoke(&self, _id: &str) -> Result<(), String> {
 		Err("context revocation unavailable".into())
@@ -541,7 +548,11 @@ async fn query_corpus(
 			.get("x-aisp-context-id")
 			.map(|v| v.to_str().map_err(|_| invalid()))
 			.transpose()?;
-		let id = issuer.0.issue(&context, parent).map_err(|_| invalid())?;
+		let id = issuer
+			.0
+			.issue_async(&context, parent)
+			.await
+			.map_err(|_| invalid())?;
 		response_headers.insert("x-aisp-context-id", id.parse().map_err(|_| invalid())?);
 	}
 	response_headers.insert(

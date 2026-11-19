@@ -1,7 +1,19 @@
-//! Shared admission for synchronous compatibility calls and awaited remote evaluations.
+//! Shared admission for synchronous compatibility calls and awaited blocking security work.
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 static REMOTE_DECISIONS: Semaphore = Semaphore::const_new(32);
+/// Preserve synchronous acknowledgement while allowing a multithreaded executor
+/// to schedule other tasks during compatibility callbacks. Current-thread
+/// embedders must use the owned async bridge for work that needs to yield.
+pub fn with_blocking_io<T>(work: impl FnOnce() -> T) -> T {
+	if tokio::runtime::Handle::try_current()
+		.is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+	{
+		tokio::task::block_in_place(work)
+	} else {
+		work()
+	}
+}
 
 pub(super) fn reserve() -> Result<SemaphorePermit<'static>, &'static str> {
 	REMOTE_DECISIONS
@@ -9,6 +21,9 @@ pub(super) fn reserve() -> Result<SemaphorePermit<'static>, &'static str> {
 		.map_err(|_| "remote security worker limit reached")
 }
 
+/// Run owned synchronous security work in the existing bounded pool. The caller
+/// must recheck its live request before using the result; cancellation does not
+/// cancel an already running disk write or release its slot prematurely.
 pub(super) async fn evaluate<T: Send + 'static>(
 	work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, &'static str> {
@@ -25,6 +40,30 @@ pub(super) async fn evaluate<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+	async fn synchronous_confirmation_allows_the_single_executor_worker_to_progress() {
+		let started = std::sync::Arc::new(tokio::sync::Notify::new());
+		let notice = started.clone();
+		let (release, receiver) = std::sync::mpsc::channel();
+		let callback = tokio::spawn(async move {
+			with_blocking_io(|| {
+				notice.notify_one();
+				receiver
+					.recv_timeout(std::time::Duration::from_secs(1))
+					.is_ok()
+			})
+		});
+		let peer = tokio::spawn(async move {
+			started.notified().await;
+			release.send(()).unwrap();
+		});
+		assert!(
+			callback.await.unwrap(),
+			"synchronous I/O stalled the executor"
+		);
+		peer.await.unwrap();
+	}
 
 	#[tokio::test]
 	async fn cancelled_waiter_keeps_capacity_until_work_finishes_and_panic_releases_it() {

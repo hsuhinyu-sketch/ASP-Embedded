@@ -106,7 +106,7 @@ impl HostExecution for SessionHost<'_> {
 		mut request: JsonRpcRequest<ClientRequest>,
 	) -> ExecutionFuture<'a, SinglePlan<Self::Error>, Self::Error> {
 		Box::pin(async move {
-			let target = super::session_security::tasks::route(&mut request, &mut context)?;
+			let target = super::session_security::tasks::route(&mut request, &mut context).await?;
 			let stream = self.relay.prepare_single(request, context, &target).await?;
 			Ok(SinglePlan {
 				stream: to_execution_messages(stream),

@@ -16,7 +16,10 @@ impl AuthorizedCall {
 		}
 		deny(&action, error)
 	}
-	pub(super) fn apply_stream(self: Box<Self>, response: &mut Response) -> Result<(), ProxyError> {
+	pub(super) async fn apply_stream(
+		self: Box<Self>,
+		response: &mut Response,
+	) -> Result<(), ProxyError> {
 		if !response.status().is_success()
 			|| response
 				.headers()
@@ -32,7 +35,7 @@ impl AuthorizedCall {
 		{
 			return Err(self.stream_denial(ObjectError::ResponseBinding));
 		}
-		self.check_live()?;
+		self.check_live().await?;
 		let cfg = self.config.a2a_objects.clone().expect("enabled");
 		let body = std::mem::replace(response.body_mut(), Body::empty());
 		// StreamReader copies into bounded read buffers, rather than accumulating arbitrary chunks.
@@ -84,7 +87,7 @@ impl AuthorizedCall {
 										return Err(call.stream_denial(ObjectError::StreamTimeout));
 								}
 								_ = tokio::time::sleep_until(reauthorize) => {
-										call.check_live()?;
+										call.check_live().await?;
 										reauthorize = Instant::now() + Duration::from_secs(cfg.reauthorize_seconds);
 										continue;
 								}
@@ -94,7 +97,7 @@ impl AuthorizedCall {
 							.ok_or_else(|| call.stream_denial(ObjectError::StreamTruncated))?
 							.map_err(|_| call.stream_denial(ObjectError::ResponseBinding))?;
 						let Frame::Event(event) = frame else { continue };
-						call.check_live()?;
+						call.check_live().await?;
 						if event.id.is_some() || event.name != "message" {
 							return Err(call.stream_denial(ObjectError::Unsupported));
 						}
@@ -116,7 +119,7 @@ impl AuthorizedCall {
 							let data = serde_json::to_vec(&rpc)
 								.map_err(|_| call.stream_denial(ObjectError::ResponseBinding))?;
 							call.check_credential().map_err(|e| call.stream_denial(e))?;
-							call.check_continuation()?;
+							call.check_continuation().await?;
 							if Instant::now() >= end {
 								return Err(call.stream_denial(ObjectError::StreamTimeout));
 							}
@@ -142,8 +145,8 @@ impl AuthorizedCall {
 		Ok(())
 	}
 
-	fn check_live(&self) -> Result<(), ProxyError> {
-		self.check_continuation()?;
+	async fn check_live(&self) -> Result<(), ProxyError> {
+		self.check_continuation().await?;
 		if self.config.validate_composition().is_err() {
 			return Err(self.stream_denial(ObjectError::Unavailable));
 		}

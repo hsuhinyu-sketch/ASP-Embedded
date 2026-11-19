@@ -1,0 +1,92 @@
+# Cargo features: gateway-llm,gateway-mcp,security-s1,security-pii,tls-aws-lc
+# Setup and port map: docs/README.md#安全网关场景-profile
+config:
+  bindAddress: 127.0.0.1
+  management:
+    mode: edge
+  securityAudit:
+    directory: ${AISP_EXAMPLE_STATE_DIR}/device-assistant/audit
+aiSystems:
+  - name: device-assistant
+    security:
+      mode: enforce
+      requiredIdentity:
+        user: true
+        tenant: true
+        agent: false
+      requiredAudit:
+        actionTypes:
+          - modelInvoke
+          - toolInvoke
+      policies:
+        - id: invoke-model
+          tenantId: tenant-a
+          actionType: modelInvoke
+          effect: allow
+          enabled: true
+          resourceId: local-model
+        - id: use-tool-session
+          tenantId: tenant-a
+          actionType: mcpSessionOperation
+          effect: allow
+          enabled: true
+        - id: list-tools
+          tenantId: tenant-a
+          actionType: toolList
+          effect: allow
+          enabled: true
+        - id: ping-tool-server
+          tenantId: tenant-a
+          actionType: mcpOperation
+          effect: allow
+          enabled: true
+          actionName: ping
+          resourceType: mcpServer
+          resourceId: local
+        - id: invoke-echo
+          tenantId: tenant-a
+          actionType: toolInvoke
+          effect: allow
+          enabled: true
+          resourceId: echo
+      mcpSessions:
+        maxSessions: 64
+        maxStreams: 32
+      dataEgress:
+        classification: internal
+        modelDestinations:
+          - 127.0.0.1:18000
+        toolDestinations:
+          - local/echo
+      pii:
+        enabled: true
+        mode: enforce
+        backend: native
+        policy:
+          entities:
+            EMAIL_ADDRESS:
+              action: mask
+    llm:
+      port: 14100
+      policies:
+        jwtAuth: &strict-jwt
+          mode: strict
+          issuer: ${AISP_EXAMPLE_ISSUER}
+          audiences:
+            - device-assistant
+          jwks:
+            file: ${AISP_EXAMPLE_JWKS_FILE}
+      models:
+        - name: local-model
+          provider: openAI
+          params:
+            baseUrl: http://127.0.0.1:18000/v1
+    mcp:
+      port: 14102
+      statefulMode: stateful
+      policies:
+        jwtAuth: *strict-jwt
+      targets:
+        - name: local
+          mcp:
+            host: http://127.0.0.1:18200/mcp

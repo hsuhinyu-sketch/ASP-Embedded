@@ -26,7 +26,10 @@ jobs:
         run: |
           python3 tests/docs/check_docs.py --public
           python3 -m unittest discover -s tests/release -p 'test_*.py' -v
+          python3 -m unittest discover -s tests/performance -p 'test_*.py' -v
       - run: cargo check --workspace
+      - name: Patched regex cache contracts
+        run: cargo test --locked -p regex-cache
       - name: Generated schema consistency and read-only check contracts
         run: |
           cargo test --locked -p xtask
@@ -105,6 +108,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - features: gateway-llm,gateway-mcp,security-s1,security-pii,tls-aws-lc
+            binary: ai-security-platform
+            profile: edge-local
           - features: llm-edge,tls-aws-lc
             binary: ai-security-platform-llm
             profile: llm

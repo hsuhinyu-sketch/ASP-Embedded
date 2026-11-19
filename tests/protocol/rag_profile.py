@@ -706,6 +706,28 @@ class Rag(RagFixture):
         self.assertNotIn(b'visible knowledge', body)
         self.assertTrue(json.loads(body)['redactedChunkIds'])
 
+    def test_contextual_rules_reload_and_reject_unknown_candidate(self):
+        self.start()
+        benign = 'The system message field stores a title.'
+        self.assertEqual(self.ingest(benign)[0], 201)
+        def assembled():
+            status, body = self.query()
+            self.assertEqual(status, 200, body)
+            return json.loads(body)
+        self.assertTrue(assembled()['removedChunkIds'])
+
+        self.system['rag']['contextGuard'] = {'ruleSet': 'contextual'}
+        self.reload()
+        self.assertEqual(assembled()['chunks'][0]['content'], benign)
+
+        self.system['rag']['contextGuard'] = {'ruleSet': 'unknown'}
+        self.reload(successful=False)
+        self.assertEqual(assembled()['chunks'][0]['content'], benign)
+
+        self.system['rag']['contextGuard'] = {'ruleSet': 'legacy'}
+        self.reload()
+        self.assertTrue(assembled()['removedChunkIds'])
+
     def test_invalid_candidate_does_not_replace_live_state(self):
         self.start()
         self.seed()

@@ -22,7 +22,70 @@ pub struct ContextBinding {
 	pub namespace: String,
 	pub fingerprint: String,
 }
+/// Completion means the store has confirmed its durable transition/checkpoint. Dropping a
+/// future does not roll back an operation that has already reached the storage worker.
+pub type ContextFuture<T> =
+	std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ContextError>> + Send>>;
 pub trait SecurityContextStore: Send + Sync {
+	fn issue_documents_async(
+		self: Arc<Self>,
+		binding: ContextBinding,
+		ttl: u64,
+		capacity: usize,
+		class: DataClassification,
+		documents: Vec<DocumentVersion>,
+	) -> ContextFuture<String>
+	where
+		Self: 'static,
+	{
+		Box::pin(async move {
+			tokio::task::spawn_blocking(move || {
+				self.issue_documents(binding, ttl, capacity, class, documents)
+			})
+			.await
+			.map_err(|_| ContextError::Unavailable)?
+		})
+	}
+	fn classification_async(
+		self: Arc<Self>,
+		id: String,
+		binding: ContextBinding,
+	) -> ContextFuture<DataClassification>
+	where
+		Self: 'static,
+	{
+		Box::pin(async move {
+			tokio::task::spawn_blocking(move || self.classification(&id, &binding))
+				.await
+				.map_err(|_| ContextError::Unavailable)?
+		})
+	}
+	fn elevate_documents_async(
+		self: Arc<Self>,
+		id: String,
+		binding: ContextBinding,
+		class: DataClassification,
+		documents: Vec<DocumentVersion>,
+	) -> ContextFuture<()>
+	where
+		Self: 'static,
+	{
+		Box::pin(async move {
+			tokio::task::spawn_blocking(move || self.elevate_documents(&id, &binding, class, documents))
+				.await
+				.map_err(|_| ContextError::Unavailable)?
+		})
+	}
+	fn revoke_async(self: Arc<Self>, id: String, binding: ContextBinding) -> ContextFuture<()>
+	where
+		Self: 'static,
+	{
+		Box::pin(async move {
+			tokio::task::spawn_blocking(move || self.revoke(&id, &binding))
+				.await
+				.map_err(|_| ContextError::Unavailable)?
+		})
+	}
 	fn register_document_validator(
 		&self,
 		_namespace: &str,
@@ -191,6 +254,15 @@ impl State {
 		binding: &ContextBinding,
 		allow_revoked: bool,
 	) -> Result<Snapshot, ContextError> {
+		self.check_snapshot(id, binding, allow_revoked)?;
+		Ok(self.records[id].snapshot.clone())
+	}
+	fn check_snapshot(
+		&mut self,
+		id: &str,
+		binding: &ContextBinding,
+		allow_revoked: bool,
+	) -> Result<(), ContextError> {
 		self.check()?;
 		let record = self.records.get(id).ok_or(ContextError::Denied)?;
 		if record.snapshot.binding != *binding
@@ -199,7 +271,7 @@ impl State {
 		{
 			return Err(ContextError::Denied);
 		}
-		Ok(record.snapshot.clone())
+		Ok(())
 	}
 	fn validate_documents(
 		&self,
@@ -257,6 +329,41 @@ impl LocalSecurityContextStore {
 				.map_err(|_| "context store unavailable")?;
 			return Ok(store);
 		}
+		let store = Self::load(spec, namespace, true)?;
+		registry.insert(path, Arc::downgrade(&store));
+		Ok(store)
+	}
+	// Offline import reuses the production replay rules without appending checkpoints.
+	#[cfg(feature = "rag-sqlite")]
+	pub(crate) fn open_for_import(
+		spec: StateJournalConfig,
+		namespace: &str,
+	) -> Result<Arc<Self>, String> {
+		validate_namespace(namespace)?;
+		std::fs::symlink_metadata(&spec.path).map_err(|_| "source Context journal missing")?;
+		Self::load(spec, namespace, false)
+	}
+	#[cfg(feature = "rag-sqlite")]
+	pub(crate) fn import_records(&self) -> Result<(Option<String>, Vec<Snapshot>, i64), String> {
+		let mut state = self
+			.state
+			.lock()
+			.map_err(|_| "Context source unavailable")?;
+		state.check().map_err(|_| "Context source unavailable")?;
+		Ok((
+			state
+				.authorities
+				.get(self.namespace.as_deref().ok_or("missing namespace")?)
+				.cloned(),
+			state.records.values().map(|r| r.snapshot.clone()).collect(),
+			state.highwater,
+		))
+	}
+	fn load(
+		spec: StateJournalConfig,
+		namespace: &str,
+		checkpoint: bool,
+	) -> Result<Arc<Self>, String> {
 		let mut state = State::default();
 		let mut snapshots: HashMap<String, Snapshot> = HashMap::new();
 		let now = chrono::Utc::now().timestamp_millis();
@@ -321,6 +428,9 @@ impl LocalSecurityContextStore {
 		})
 		.map_err(|e| format!("cannot open context journal: {e}"))?;
 		let fresh = journal.is_fresh();
+		if fresh && !checkpoint {
+			return Err("migration requires an existing source journal".into());
+		}
 		state.journal = Some(journal);
 		let monotonic = Instant::now();
 		for (id, snapshot) in snapshots {
@@ -331,22 +441,22 @@ impl LocalSecurityContextStore {
 				state.records.insert(id, Record { snapshot, deadline });
 			}
 		}
-		state
-			.commit(if fresh {
-				Change::Init {
-					namespace: namespace.into(),
-				}
-			} else {
-				Change::Checkpoint
-			})
-			.map_err(|_| "cannot initialize context journal")?;
-		let store = Arc::new(Self {
+		if checkpoint {
+			state
+				.commit(if fresh {
+					Change::Init {
+						namespace: namespace.into(),
+					}
+				} else {
+					Change::Checkpoint
+				})
+				.map_err(|_| "cannot initialize context journal")?;
+		}
+		Ok(Arc::new(Self {
 			state: Mutex::new(state),
 			namespace: Some(namespace.into()),
 			spec: Some(spec),
-		});
-		registry.insert(path, Arc::downgrade(&store));
-		Ok(store)
+		}))
 	}
 }
 pub(crate) fn validate_namespace(namespace: &str) -> Result<(), String> {
@@ -537,13 +647,13 @@ impl SecurityContextStore for LocalSecurityContextStore {
 		binding: &ContextBinding,
 	) -> Result<DataClassification, ContextError> {
 		let mut state = self.state.lock().map_err(|_| ContextError::Unavailable)?;
-		let snapshot = state.snapshot(id, binding, false)?;
-		state.validate_snapshot_documents(&snapshot)?;
+		state.check_snapshot(id, binding, false)?;
+		state.validate_snapshot_documents(&state.records[id].snapshot)?;
 		// Persist a clock highwater before disclosing use, not an authorization cache.
 		state.commit(Change::Checkpoint)?;
-		state.snapshot(id, binding, false)?;
-		state.validate_snapshot_documents(&snapshot)?;
-		Ok(snapshot.classification)
+		state.check_snapshot(id, binding, false)?;
+		state.validate_snapshot_documents(&state.records[id].snapshot)?;
+		Ok(state.records[id].snapshot.classification)
 	}
 	fn elevate(
 		&self,
@@ -578,7 +688,7 @@ impl SecurityContextStore for LocalSecurityContextStore {
 			.get_mut(id)
 			.ok_or(ContextError::Denied)?
 			.snapshot = snapshot;
-		state.snapshot(id, binding, false)?;
+		state.check_snapshot(id, binding, false)?;
 		state.validate_snapshot_documents(&state.records[id].snapshot)?;
 		Ok(())
 	}
@@ -642,7 +752,9 @@ impl std::fmt::Debug for ContextStoreSlot {
 impl crate::cross_component::CrossComponentConfig {
 	pub fn prepare_store(&mut self) -> Result<(), String> {
 		self.validate()?;
-		if let Some(storage) = &self.storage {
+		if self.sqlite.is_some() {
+			self.store = Default::default(); // Initialized asynchronously before publication.
+		} else if let Some(storage) = &self.storage {
 			let store = LocalSecurityContextStore::open(storage.clone(), &self.namespace)?;
 			let slot = OnceLock::new();
 			let _ = slot.set(store as Arc<dyn SecurityContextStore>);
@@ -652,13 +764,34 @@ impl crate::cross_component::CrossComponentConfig {
 		}
 		Ok(())
 	}
+	pub async fn prepare_store_async(&self) -> Result<(), String> {
+		self.validate()?;
+		#[cfg(feature = "rag-sqlite")]
+		if let Some(config) = &self.sqlite {
+			let store = crate::rag_sqlite::SqliteRagStore::open_shared(config.clone()).await?;
+			// OnceLock is shared by clones of the same prepared declaration.
+			let store: Arc<dyn SecurityContextStore> = store;
+			if let Err(prepared) = self.store.0.set(store) {
+				if self
+					.store
+					.get()
+					.is_none_or(|existing| !Arc::ptr_eq(&existing, &prepared))
+				{
+					return Err("Context store already initialized with another authority".into());
+				}
+			}
+		}
+		Ok(())
+	}
+
 	pub fn context_store(&self) -> Result<Arc<dyn SecurityContextStore>, ContextError> {
 		if let Some(store) = self.store.get() {
 			return Ok(store);
 		}
-		match self.storage {
-			Some(_) => self.store.0.get().cloned().ok_or(ContextError::Unavailable),
-			None => Ok(shared_memory_store()),
+		if self.storage.is_some() || self.sqlite.is_some() {
+			Err(ContextError::Unavailable)
+		} else {
+			Ok(shared_memory_store())
 		}
 	}
 }

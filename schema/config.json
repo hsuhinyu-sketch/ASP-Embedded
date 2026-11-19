@@ -116,6 +116,14 @@
             "null"
           ]
         },
+        "bindAddress": {
+          "description": "Address for local-config protocol listeners; defaults to the existing wildcard address.\nManagement, metrics, readiness and the separately mounted RAG listener use their own addresses.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "ip"
+        },
         "dns": {
           "description": "DNS resolver settings.",
           "anyOf": [
@@ -199,7 +207,7 @@
           ]
         },
         "adminAddr": {
-          "description": "Admin UI address in the format \"ip:port\", \"localhost:port\", \"unix:/path/to/socket\", or \"off\"",
+          "description": "Admin address in the format \"ip:port\", \"localhost:port\", \"unix:/path/to/socket\", or \"off\"",
           "type": [
             "string",
             "null"
@@ -10296,7 +10304,18 @@
           "type": "string"
         },
         "security": {
-          "description": "Common security controls applied to every enabled gateway in this AI system."
+          "description": "Common security controls applied to every enabled gateway in this AI system.",
+          "properties": {
+            "crossComponent": {
+              "properties": {
+                "restrictUntrustedPayloads": {
+                  "description": "Apply Restricted egress policy to request payloads in a dedicated RAG and direct OpenAI-compatible model gateway.",
+                  "type": "boolean",
+                  "default": false
+                }
+              }
+            }
+          }
         },
         "inference": {
           "description": "inference contains system-wide LLM controls. It is compiled into the selected LLM\ngateway's existing parameter, rate-limit, and routing policies.",
@@ -10340,7 +10359,21 @@
           ]
         },
         "rag": {
-          "description": "RAG declares the separately mounted retrieval/ingestion HTTP gateway. Its security policy\nstays in this AI system's `security` block; RAG-specific source, context, and backend values\nare validated here and used when the RAG router is mounted by the host application."
+          "description": "RAG declares the separately mounted retrieval/ingestion HTTP gateway. Its security policy\nstays in this AI system's `security` block; RAG-specific source, context, and backend values\nare validated here and used when the RAG router is mounted by the host application.",
+          "properties": {
+            "contextGuard": {
+              "properties": {
+                "ruleSet": {
+                  "description": "Built-in rules used when indirectInstructionPatterns is omitted.",
+                  "enum": [
+                    "legacy",
+                    "contextual"
+                  ],
+                  "default": "legacy"
+                }
+              }
+            }
+          }
         }
       },
       "additionalProperties": false,

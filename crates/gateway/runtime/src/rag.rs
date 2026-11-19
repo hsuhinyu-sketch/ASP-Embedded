@@ -236,6 +236,12 @@ async fn build_router(
 		.security
 		.prepare_runtime_stores()
 		.map_err(anyhow::Error::msg)?;
+	if let Some(flow) = &system.security.cross_component {
+		flow
+			.prepare_store_async()
+			.await
+			.map_err(anyhow::Error::msg)?;
+	}
 	let jwt = Arc::new(
 		system
 			.authentication
@@ -255,20 +261,54 @@ async fn build_router(
 			)
 			.map_err(|error| anyhow::anyhow!("RAG backend for '{}': {error}", system.name))?,
 	);
-	let lifecycle = system
-		.gateway
-		.lifecycle
-		.clone()
-		.map(security_rag::lifecycle::DocumentLifecycleStore::open)
-		.transpose()
-		.map_err(anyhow::Error::msg)?;
-	if let (Some(store), Some(flow)) = (&lifecycle, &system.security.cross_component) {
-		flow
-			.context_store()
-			.map_err(|_| anyhow::anyhow!("context store unavailable"))?
-			.register_document_validator(&flow.namespace, store.clone())
-			.map_err(|_| anyhow::anyhow!("document validator registration failed"))?;
-	}
+	let lifecycle: Option<Arc<dyn security_rag::lifecycle::DocumentLifecycle>> = {
+		#[cfg(feature = "security-rag-sqlite")]
+		let sqlite = system
+			.security
+			.cross_component
+			.as_ref()
+			.and_then(|flow| flow.sqlite.as_ref());
+		#[cfg(not(feature = "security-rag-sqlite"))]
+		let sqlite: Option<&security_integration_runtime::rag_storage::SqliteRagConfig> = None;
+		if let Some(sqlite) = sqlite {
+			if system.gateway.lifecycle.is_some() || system.gateway.qdrant.integrity.is_none() {
+				anyhow::bail!(
+					"joint SQLite RAG state excludes rag.lifecycle and requires qdrant.integrity"
+				);
+			}
+			#[cfg(feature = "security-rag-sqlite")]
+			{
+				Some(
+					security_integration_runtime::rag_sqlite::SqliteRagStore::open_shared(sqlite.clone())
+						.await
+						.map_err(anyhow::Error::msg)?
+						as Arc<dyn security_rag::lifecycle::DocumentLifecycle>,
+				)
+			}
+			#[cfg(not(feature = "security-rag-sqlite"))]
+			{
+				let _ = sqlite;
+				anyhow::bail!("SQLite RAG state was not compiled")
+			}
+		} else {
+			let lifecycle = system
+				.gateway
+				.lifecycle
+				.clone()
+				.map(security_rag::lifecycle::DocumentLifecycleStore::open)
+				.transpose()
+				.map_err(anyhow::Error::msg)?;
+			if let (Some(store), Some(flow)) = (&lifecycle, &system.security.cross_component) {
+				flow
+					.context_store()
+					.map_err(|_| anyhow::anyhow!("context store unavailable"))?
+					.register_document_validator(&flow.namespace, store.clone())
+					.map_err(|_| anyhow::anyhow!("document validator registration failed"))?;
+			}
+			lifecycle.map(|store| store as Arc<dyn security_rag::lifecycle::DocumentLifecycle>)
+		}
+	};
+
 	let purger: Arc<dyn security_rag::lifecycle::DocumentPurger> = backend.clone();
 	let backend = Arc::new(security_rag::lifecycle::LifecycleBackend {
 		backend,

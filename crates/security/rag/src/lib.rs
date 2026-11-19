@@ -26,8 +26,8 @@ pub mod sources;
 
 pub use context::{
 	ContextAssemblyError, ContextAuditEvent, ContextAuditOutcome, ContextAuditSink, ContextFinding,
-	ContextFindingKind, ContextGuard, ContextGuardConfig, ContextGuardMode, GuardedContext,
-	InMemoryContextAuditSink,
+	ContextFindingKind, ContextGuard, ContextGuardConfig, ContextGuardMode, ContextGuardRuleSet,
+	GuardedContext, InMemoryContextAuditSink,
 };
 pub use ingestion::{
 	ContentClassificationRule, ContentLabelRule, DocumentIngestBackend, DocumentIngestRequest,

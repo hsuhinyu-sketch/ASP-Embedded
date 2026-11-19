@@ -17,6 +17,12 @@ import sys
 import time
 
 PROFILES = {
+    'cross-protocol-corpus': ('cross_protocol_corpus.py', 24),
+    'context-guard-comparison': ('cross_protocol_corpus.py', 72, '--compare'),
+    'context-guard-semantic-baseline': ('cross_protocol_corpus.py', 24, '--semantic-holdout'),
+    'cross-protocol-attacks': ('cross_protocol_attacks.py', 10),
+    'audit': ('audit_profile.py', 4),
+    'edge-local': ('edge_local_profile.py', 8),
     'resource-watcher': ('resource_watcher_profile.py', 3),
     'config-watcher': ('config_watcher_profile.py', 4),
     'listener-lifecycle': ('listener_lifecycle_profile.py', 4),
@@ -32,11 +38,14 @@ PROFILES = {
     'infrastructure': ('infrastructure_profile.py', 1),
     'a2a': ('a2a_profile.py', 12),
     'a2a-durable': ('a2a_durable_profile.py', 6),
-    'rag': ('rag_profile.py', 30),
+    'rag': ('rag_profile.py', 31),
     'security-content': ('security_content_profile.py', 37),
-    'pii': ('pii_profile.py', 30),
-    'rag-llm': ('rag_llm_profile.py', 19),
+    'pii': ('pii_profile.py', 31),
+    'rag-llm': ('rag_llm_profile.py', 23),
+    'rag-sqlite': ('rag_sqlite_profile.py', 26),
+    'rag-sqlite-workflow': ('rag_sqlite_workflow_profile.py', 13),
     'workflow': ('workflow_profile.py', 6),
+    'restricted-tools': ('workflow_profile.py', 7, '--restricted-tools'),
     'workflow-durable': ('workflow_durable_profile.py', 7),
 }
 
@@ -191,14 +200,14 @@ def main():
             evidence['parentNamespace'] = args.namespace_child
         artifacts = report.with_suffix('.artifacts')
         artifacts.mkdir(exist_ok=False)
-        worker, expected_tests = PROFILES[args.profile]
+        worker, expected_tests, *worker_args = PROFILES[args.profile]
         for number in range(1, args.rounds + 1):
             directory = artifacts / f'round-{number:02}'
             directory.mkdir()
             result_path = directory / 'acceptance.json'
             before = clock_sample()
             exit_code = run_round([sys.executable, str(Path(__file__).with_name(worker)),
-                                   '--binary', str(binary), '--report', str(result_path)],
+                                   '--binary', str(binary), '--report', str(result_path), *worker_args],
                                   directory / 'acceptance.log', args.timeout)
             after = clock_sample()
             result = json.loads(result_path.read_text()) if result_path.exists() else {}

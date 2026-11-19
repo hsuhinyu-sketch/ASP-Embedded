@@ -55,6 +55,14 @@ pub struct RelayInputs {
 }
 
 impl RelayInputs {
+	pub(super) fn restricted_payloads(&self) -> bool {
+		self
+			.security_audit
+			.as_ref()
+			.and_then(|config| config.cross_component.as_ref())
+			.is_some_and(|flow| flow.restrict_untrusted_payloads)
+	}
+
 	pub fn build_new_connections(self) -> Result<Relay, mcp::Error> {
 		let r = Relay::new(self.backend, self.policies, self.client)?;
 		Ok(Relay {
@@ -581,7 +589,8 @@ impl Relay {
 				&mut ctx,
 				service_name,
 				self.mcp_guardrails.is_some(),
-			)?
+			)
+			.await?
 		} else {
 			None
 		};
@@ -608,7 +617,7 @@ impl Relay {
 		};
 		let guardrails = self.build_guardrails_ctx(&r, &ctx, vec![service_name.to_string()]);
 		let protected_request = r.clone();
-		super::session_security::prepare_subscription(&r, &mut ctx, service_name)?;
+		super::session_security::prepare_subscription(&r, &mut ctx, service_name).await?;
 		let stream = self.rewrite_outbound_server_messages(
 			service_name,
 			Box::pin(us.generic_stream(r, &ctx).assert_size::<{ 3 * 1024 }>()).await?,
@@ -626,7 +635,7 @@ impl Relay {
 				context: ctx.clone(),
 			}),
 		);
-		let stream = crate::execution_budget::record_mcp_result(stream, &ctx, id.clone());
+		let stream = crate::execution_budget::record_mcp_result(stream.await, &ctx, id.clone());
 
 		match guardrails {
 			Some(guardrails) => Ok(Messages::from_stream(wrap_with_guardrails(
@@ -717,7 +726,7 @@ impl Relay {
 			match result {
 				Ok(s) => {
 					let s = super::session_security::protect_messages(s, &ctx, None, name.as_str());
-					let s = self.rewrite_outbound_server_messages(name.as_str(), s);
+					let s = self.rewrite_outbound_server_messages(name.as_str(), s.await);
 					streams.push((name.to_string(), s));
 				},
 				Err(e) => {
@@ -890,7 +899,7 @@ impl Relay {
 			match result {
 				Ok(s) => {
 					let s = super::session_security::protect_messages(s, &ctx, Some(&r), name.as_str());
-					let mut s = self.rewrite_outbound_server_messages(name.as_str(), s);
+					let mut s = self.rewrite_outbound_server_messages(name.as_str(), s.await);
 					if let Some(subscription_id) = subscription_id.clone() {
 						s = s.map_server_messages(move |message| {
 							set_subscription_ack_id(message, &subscription_id)

@@ -66,28 +66,38 @@ impl DocumentChunker for FixedWindowChunker {
 		if document.content.trim().is_empty() {
 			return Err("document content must not be empty".into());
 		}
-		let characters = document.content.chars().collect::<Vec<_>>();
 		let mut chunks = Vec::new();
-		let mut start = 0;
-		while start < characters.len() {
-			let mut end = (start + self.max_chars).min(characters.len());
-			if end < characters.len()
-				&& let Some(relative_break) = characters[start..end]
-					.iter()
-					.rposition(|character| character.is_whitespace())
-					.filter(|relative_break| *relative_break > 0)
+		let mut start_byte = 0;
+		let mut start_char = 0;
+		while start_byte < document.content.len() {
+			let mut end_byte = start_byte;
+			let mut end_char = start_char;
+			let mut last_break = None;
+			for (offset, character) in document.content[start_byte..]
+				.char_indices()
+				.take(self.max_chars)
 			{
-				end = start + relative_break;
+				if offset != 0 && character.is_whitespace() {
+					last_break = Some((start_byte + offset, end_char));
+				}
+				end_byte = start_byte + offset + character.len_utf8();
+				end_char += 1;
 			}
-			let content = characters[start..end].iter().collect::<String>();
+			if end_byte < document.content.len()
+				&& let Some(boundary) = last_break
+			{
+				(end_byte, end_char) = boundary;
+			}
+			let content = &document.content[start_byte..end_byte];
 			let token_count = content.split_whitespace().count() as u64;
 			chunks.push(document.to_chunk(
-				format!("{}:{start}", document.document_id),
+				format!("{}:{start_char}", document.document_id),
 				content,
 				token_count.max(1),
 				access.clone(),
 			));
-			start = end;
+			start_byte = end_byte;
+			start_char = end_char;
 		}
 		Ok(chunks)
 	}
@@ -201,8 +211,9 @@ impl<E, C> QdrantBackend<E, C> {
 	where
 		E: EmbeddingProvider,
 	{
-		let mut points = Vec::with_capacity(chunks.len());
-		for chunk in chunks {
+		// Release each point's JSON tree while preparing the complete, single-request body.
+		let mut body = b"{\"points\":[".to_vec();
+		for (index, chunk) in chunks.into_iter().enumerate() {
 			let vector = self.embeddings.embed(&chunk.content).await?;
 			if vector.is_empty() {
 				return Err("embedding provider returned an empty vector".into());
@@ -214,14 +225,18 @@ impl<E, C> QdrantBackend<E, C> {
 				payload["integrity"] = serde_json::to_value(proof)
 					.map_err(|error| format!("cannot encode integrity proof: {error}"))?;
 			}
-			points.push(json!({
+			let point = json!({
 				"id": chunk.id,
 				"vector": vector,
 				"payload": payload,
-			}));
+			});
+			if index != 0 {
+				body.push(b',');
+			}
+			serde_json::to_writer(&mut body, &point)
+				.map_err(|error| format!("failed to serialize Qdrant upsert request: {error}"))?;
 		}
-		let body = serde_json::to_vec(&json!({ "points": points }))
-			.map_err(|error| format!("failed to serialize Qdrant upsert request: {error}"))?;
+		body.extend_from_slice(b"]}");
 		let response = self
 			.request(
 				reqwest::Method::PUT,
@@ -570,3 +585,7 @@ fn valid_collection_name(value: &str) -> bool {
 			.chars()
 			.all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
 }
+
+#[cfg(test)]
+#[path = "qdrant_tests.rs"]
+mod tests;

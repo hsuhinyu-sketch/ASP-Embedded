@@ -168,7 +168,7 @@ impl Relay {
 				UpstreamError::InvalidRequest("reverse response requires protected session".into())
 			})?;
 		let (server, message, action, response_ticket) =
-			session_security::reverse::response(access, message)?;
+			session_security::reverse::response(access, message).await?;
 		if let Some(ticket) = &response_ticket {
 			ctx.extensions_mut().insert(ticket.clone());
 		}
@@ -198,7 +198,7 @@ impl Relay {
 			.ok_or_else(|| {
 				UpstreamError::InvalidRequest("reverse cancellation requires protected session".into())
 			})?;
-		let server = session_security::reverse::cancel(access, &notification)?;
+		let server = session_security::reverse::cancel(access, &notification).await?;
 		let action = security_pipeline::mcp_operation_for_identity(
 			uuid::Uuid::new_v4().to_string(),
 			crate::security::identity_from_extensions(http.extensions()),

@@ -4,7 +4,7 @@ use security_pipeline::GatewayIdentity;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdentityBindingError;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifiedOwner {
 	pub(crate) issuer: String,

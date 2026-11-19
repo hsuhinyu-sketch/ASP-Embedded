@@ -29,8 +29,8 @@ impl Drop for Pending {
 	}
 }
 impl Ticket {
-	pub(super) fn commit(&self, access: &SessionAccess) -> Result<(), ClientError> {
-		access.check().map_err(ClientError::new)?;
+	pub(super) async fn commit(&self, access: &SessionAccess) -> Result<(), ClientError> {
+		access.check().await.map_err(ClientError::new)?;
 		if !access
 			.binding
 			.as_ref()
@@ -38,8 +38,10 @@ impl Ticket {
 		{
 			return Err(ClientError::new(access.denial("subscription-binding")));
 		}
-		authorize_resource(access, &self.0.key.0, &self.0.key.1).map_err(ClientError::new)?;
-		access.current().map_err(ClientError::new)?;
+		authorize_resource(access, &self.0.key.0, &self.0.key.1)
+			.await
+			.map_err(ClientError::new)?;
+		access.current().await.map_err(ClientError::new)?;
 		let mut entries = self
 			.0
 			.binding
@@ -57,7 +59,7 @@ impl Ticket {
 	}
 }
 
-pub(crate) fn prepare_subscription(
+pub(crate) async fn prepare_subscription(
 	request: &rmcp::model::JsonRpcRequest<rmcp::model::ClientRequest>,
 	ctx: &mut super::super::upstream::IncomingRequestContext,
 	server: &str,
@@ -72,8 +74,8 @@ pub(crate) fn prepare_subscription(
 		ClientRequest::UnsubscribeRequest(r) => (&r.params.uri, false),
 		_ => return Ok(()),
 	};
-	let result = (|| {
-		access.check()?;
+	let result = async {
+		access.check().await?;
 		if uri.is_empty() || uri.trim() != uri || uri.len() > 4096 {
 			return Err(access.denial("resource-identifier"));
 		}
@@ -83,7 +85,7 @@ pub(crate) fn prepare_subscription(
 			.ok_or_else(|| access.denial("subscription-requires-session"))?;
 		let key = (server.to_string(), uri.clone());
 		if subscribe {
-			authorize_resource(access, server, uri)?;
+			authorize_resource(access, server, uri).await?;
 		}
 		let mut entries = binding
 			.subscriptions
@@ -108,7 +110,8 @@ pub(crate) fn prepare_subscription(
 			key,
 			nonce,
 		}))))
-	})();
+	}
+	.await;
 	let ticket =
 		result.map_err(|e| super::super::upstream::UpstreamError::InvalidRequest(e.to_string()))?;
 	if let Some(ticket) = ticket {
@@ -117,7 +120,11 @@ pub(crate) fn prepare_subscription(
 	Ok(())
 }
 
-fn authorize_resource(access: &SessionAccess, server: &str, uri: &str) -> Result<(), ProxyError> {
+async fn authorize_resource(
+	access: &SessionAccess,
+	server: &str,
+	uri: &str,
+) -> Result<(), ProxyError> {
 	let cel = super::super::rbac::CelExecWrapper::new((*access.authorization_request).clone());
 	if !access.policies.validate(
 		&super::super::rbac::ResourceType::Resource(super::super::rbac::ResourceId::new(
@@ -150,13 +157,13 @@ fn authorize_resource(access: &SessionAccess, server: &str, uri: &str) -> Result
 			.map_err(|_| access.denial("resource-egress"))?;
 		}
 		if let Some(flow) = &access.flow {
-			flow.check(&action, server)?;
+			flow.check_async(&action, server).await?;
 		}
 	}
 	Ok(())
 }
 
-pub(super) fn notification(
+pub(super) async fn notification(
 	access: &SessionAccess,
 	server: &str,
 	message: &rmcp::model::ServerJsonRpcMessage,
@@ -172,7 +179,7 @@ pub(super) fn notification(
 		.as_ref()
 		.ok_or_else(|| access.denial("subscription-requires-session"))?;
 	let key = (server.to_string(), n.params.uri.clone());
-	access.check()?;
+	access.check().await?;
 	let generation = {
 		let entries = binding
 			.subscriptions
@@ -185,8 +192,8 @@ pub(super) fn notification(
 	};
 	// Remote authorization must not hold the registry lock. A concurrent unsubscribe or
 	// replacement invalidates this notification even if the new subscription has the same URI.
-	authorize_resource(access, server, &n.params.uri)?;
-	access.current()?;
+	authorize_resource(access, server, &n.params.uri).await?;
+	access.current().await?;
 	if !binding
 		.subscriptions
 		.lock()

@@ -25,7 +25,7 @@ python3 scripts/prepare_release.py --version vX.Y.Z-rc.N --profile llm
 
 五种产物均使用 `ai-security-platform` 入口，场景名体现在压缩包和 manifest 中。Full 含 LLM/MCP/A2A/RAG 与模型路由；上述组合不启用普通请求日志数据库、OTLP 或云身份 SDK。需要这些集成时另选已有 features 并重新验证，不能把不同组合的结果混用。`security-s1` 提供统一执行底座；安全配置仍须明确 Enforce、可信身份及场景所需控制，默认 Audit 行为没有改变。
 
-输出位于 `target/release-dist/`：场景/版本/target 命名的 tar.gz 及 SHA-256 文件。包内仅含可执行文件、manifest、Cargo.lock、许可和本说明，不带测试替身、密钥、缓存、基准原始数据或开发日志。manifest 记录 features、构建命令、源码提交、二进制构建标识及各载荷文件摘要；同名产物拒绝覆盖。
+输出位于 `target/release-dist/`：场景/版本/target 命名的 tar.gz 及 SHA-256 文件。包内仅含可执行文件、manifest、Cargo.lock、许可（含 `LICENSE-regex-cache`）和本说明，不带测试替身、密钥、缓存、基准原始数据或开发日志。manifest 记录 features、构建命令、源码提交、二进制构建标识及各载荷文件摘要；同名产物拒绝覆盖。
 
 ```sh
 cd target/release-dist
@@ -40,6 +40,6 @@ sha256sum -c ai-security-platform-*.sha256
 
 上传仓库前核对 `git status --short` 和提交范围，确保代码、测试、脚本及公开使用文档完整纳入，不要只提交 tracked 文件。阶段计划、交接说明、审查与性能报告及验证数据仅本地保留并由 Git 忽略；Python 缓存、target、环境变量文件不属于源码交付。发布时以相同提交上的 Rust CI 与候选产物回归结果为依据，最终选择版本和发布操作另行进行。
 
-已移除 Runtime 的 `SECURITY_UI_DEMO` / `SECURITY_UI_DEMO_PROFILE` 演示事件注入路径；这些旧环境设置不再向安全事件流及持久化日志写入虚构记录，演示界面从实际业务请求获得数据。注册到现有 IdP 客户端的 MCP 元数据应答仍保留，生产诊断接口和配置兼容路径也保留。
+Runtime 仅记录实际运行产生的安全事件。注册到现有 IdP 客户端的 MCP 元数据应答、诊断接口及配置兼容路径保留。
 
 发布说明应包含：组件化场景及功能、严格安全配置与内容 guard 等兼容性变化、实际验证范围、已知限制。兼容性变化和职责边界见源码仓库 `docs/CHANGELOG.md`、`docs/architecture/README.md`。候选提交必须运行对应验证，不能沿用历史测试结果。

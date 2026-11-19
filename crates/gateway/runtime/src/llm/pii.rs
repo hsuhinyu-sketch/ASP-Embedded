@@ -7,6 +7,10 @@ use security_pii::{PiiError, PiiMode};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+#[cfg(test)]
+#[path = "pii_tests.rs"]
+mod tests;
+
 #[derive(Clone)]
 struct Bindings {
 	configs: Vec<Arc<SecurityConfig>>,
@@ -123,9 +127,15 @@ pub(super) async fn inspect<R: RequestType>(
 				.map_err(|_| PiiError::OutputLimit)?;
 			Ok(Some(body))
 		};
-		let result = tokio::time::timeout(Duration::from_millis(pii.timeout_ms), work)
+		let deadline = tokio::time::Instant::now() + Duration::from_millis(pii.timeout_ms);
+		let result = tokio::time::timeout_at(deadline, work)
 			.await
 			.unwrap_or(Err(PiiError::Timeout));
+		let result = if tokio::time::Instant::now() >= deadline {
+			Err(PiiError::Timeout)
+		} else {
+			result
+		};
 		let (body, failure, blocked) = match result {
 			Ok(Some(body)) => (Some(body), observed_error, false),
 			Ok(None) => (None, Some("blocked".into()), true),
@@ -145,7 +155,9 @@ pub(super) async fn inspect<R: RequestType>(
 				return Ok(true);
 			}
 			let body = body.ok_or(AIError::PiiInspection)?;
-			req.replace_pii_body(body)?;
+			if modified {
+				req.replace_pii_body(body)?;
+			}
 		}
 	}
 	Ok(false)

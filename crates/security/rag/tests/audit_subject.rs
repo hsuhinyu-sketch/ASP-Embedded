@@ -59,6 +59,69 @@ fn identity() -> GatewayIdentity {
 }
 
 #[test]
+fn prepared_unicode_patterns_keep_labels_classification_and_quarantine_order() {
+	let cfg = IngestionGuardConfig {
+		default_classification: DataClassification::Public,
+		label_rules: vec![ContentLabelRule {
+			label: "MiXeD-Label".into(),
+			pattern: "İSTANBUL".into(),
+		}],
+		classification_rules: vec![
+			ContentClassificationRule {
+				id: "first".into(),
+				classification: DataClassification::Restricted,
+				pattern: "SECRET".into(),
+			},
+			ContentClassificationRule {
+				id: "second".into(),
+				classification: DataClassification::Restricted,
+				pattern: "İSTANBUL".into(),
+			},
+		],
+		quarantine_patterns: vec!["PRIVATE KEY".into(), "İSTANBUL".into()],
+		..Default::default()
+	};
+	let audit = InMemoryIngestionAuditSink::default();
+	let ingestor = SecureIngestor::new(
+		Backend(true),
+		SecurityPipeline::new(Policy(true), InMemoryAuditSink::default()),
+		cfg.clone(),
+		&audit,
+	)
+	.unwrap();
+	let content = "Secret in İSTANBUL: private key";
+	let result = drive(ingestor.ingest(
+		"unicode",
+		identity(),
+		DocumentIngestRequest::new("docs", "doc", "https://source.test/doc", content),
+	))
+	.unwrap();
+	let IngestionResult::Quarantined(value) = result else {
+		panic!("quarantine patterns were lost")
+	};
+	assert_eq!(value.document.content, content);
+	assert_eq!(value.document.labels, ["MiXeD-Label"]);
+	assert_eq!(
+		value.document.classification,
+		DataClassification::Restricted
+	);
+	assert_eq!(value.document.classification_source, "rule:first");
+	assert_eq!(
+		value
+			.findings
+			.iter()
+			.map(|f| f.rule_id.as_str())
+			.collect::<Vec<_>>(),
+		["quarantine-pattern-0", "quarantine-pattern-1"]
+	);
+	assert_eq!(cfg.label_rules[0].pattern, "İSTANBUL");
+	assert_eq!(
+		audit.events()[0].subject.tenant_id.as_deref(),
+		Some("tenant-a")
+	);
+}
+
+#[test]
 fn ingestion_outcomes_preserve_subject_without_filling_missing_fields() {
 	for (allow, backend_ok, content) in [
 		(true, true, "knowledge"),

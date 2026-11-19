@@ -554,9 +554,11 @@ async fn create_invocation(
 		return Err(ProxyError::InvalidRequest);
 	}
 	let hash = security_pipeline::arguments_hash(&serde_json::Value::Object(input.arguments));
-	let result = scope
-		.handle
-		.issue_invocation(&format!("{}/{}", input.server, input.tool), &hash);
+	let result = security_integration_runtime::with_blocking_io(|| {
+		scope
+			.handle
+			.issue_invocation(&format!("{}/{}", input.server, input.tool), &hash)
+	});
 	audit_invocation(
 		&action,
 		result.as_ref().map(|_| ()).map_err(|e| *e),

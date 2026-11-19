@@ -62,6 +62,7 @@ providers-gcp = ["dep:google-cloud-auth"]
 database = ["dep:sqlx"]
 # Durable A2A ownership metadata, independent of request log persistence.
 security-a2a-sqlite = ["security-integration-runtime/a2a-sqlite"]
+security-rag-sqlite = ["security-integration-runtime/rag-sqlite"]
 # OpenTelemetry trace/log export.
 telemetry-otlp = [
     "dep:opentelemetry",

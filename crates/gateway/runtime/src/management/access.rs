@@ -46,6 +46,9 @@ impl ManagementConfig {
 			return false;
 		}
 		let read = method == Method::GET || method == Method::HEAD;
+		if read && path == "/api/security/audit" {
+			return true;
+		}
 		if self.mode != Mode::Demo {
 			return false;
 		}

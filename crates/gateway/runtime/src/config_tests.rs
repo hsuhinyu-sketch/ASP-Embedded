@@ -13,6 +13,41 @@ async fn normalize(config: &Config, document: &str) -> anyhow::Result<Normalized
 }
 
 #[tokio::test]
+async fn local_bind_address_controls_protocol_listeners_and_requires_restart() {
+	for address in ["127.0.0.1", "::1"] {
+		let document = json!({"config":{"bindAddress":address},"binds":[{
+			"port":18080,"listeners":[{"protocol":"HTTP","routes":[]}]
+		}]})
+		.to_string();
+		let config = parse_config(document.clone(), None).unwrap();
+		let normalized = normalize(&config, &document).await.unwrap();
+		assert_eq!(
+			normalized.binds[0].address.ip(),
+			address.parse::<IpAddr>().unwrap()
+		);
+		let mut changed: serde_json::Value = serde_json::from_str(&document).unwrap();
+		changed["config"]["bindAddress"] = json!("0.0.0.0");
+		assert!(
+			normalize(&config, &changed.to_string())
+				.await
+				.unwrap_err()
+				.to_string()
+				.contains("restart required")
+		);
+	}
+}
+
+#[test]
+fn local_bind_address_rejects_invalid_or_disabled_address_families() {
+	for document in [
+		r#"config: {bindAddress: localhost}"#,
+		r#"config: {bindAddress: '::1', enableIpv6: false}"#,
+	] {
+		assert!(parse_config(document.into(), None).is_err());
+	}
+}
+
+#[tokio::test]
 async fn startup_changes_are_rejected_before_local_deserialization() {
 	let config = parse_config("config: {mcp: {sessionTtl: 30s}}".into(), None).unwrap();
 	for candidate in [

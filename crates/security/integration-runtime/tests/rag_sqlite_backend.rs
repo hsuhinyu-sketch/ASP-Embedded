@@ -819,3 +819,358 @@ async fn pinned_reader_that_prevents_wal_reclamation_fails_closed() {
 	assert!(store.classification(&id, &binding()).await.is_ok());
 	store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn shared_domain_ports_enforce_the_same_document_revision_and_context_binding() {
+	use security_integration_runtime::context_store::SecurityContextStore;
+	use security_rag::lifecycle::DocumentLifecycle;
+	let directory = Directory::new();
+	let store = SqliteRagStore::open_shared(directory.config())
+		.await
+		.unwrap();
+	let contexts: Arc<dyn SecurityContextStore> = store.clone();
+	let documents: Arc<dyn DocumentLifecycle> = store.clone();
+	let meta = documents.begin_index(&document(), access()).await.unwrap();
+	documents.activate(&meta.key, meta.revision).await.unwrap();
+	let id = contexts
+		.clone()
+		.issue_documents_async(
+			binding(),
+			60,
+			16,
+			DataClassification::Restricted,
+			vec![reference(&meta)],
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		contexts.classification(&id, &binding()),
+		Err(ContextError::Unavailable),
+		"sync callers cannot fall back or wait for SQL"
+	);
+	assert_eq!(
+		contexts
+			.clone()
+			.classification_async(id.clone(), binding())
+			.await
+			.unwrap(),
+		DataClassification::Restricted
+	);
+	let mut foreign = binding();
+	foreign.fingerprint.push_str("-changed");
+	assert_eq!(
+		contexts
+			.clone()
+			.classification_async(id.clone(), foreign)
+			.await,
+		Err(ContextError::Denied)
+	);
+	documents
+		.mutate(&meta.key, meta.revision, DocumentMutation::Revoke)
+		.await
+		.unwrap();
+	assert_eq!(
+		contexts.clone().classification_async(id, binding()).await,
+		Err(ContextError::Denied)
+	);
+	assert!(
+		documents
+			.validate_documents(&binding().owner.identity().into(), &[reference(&meta)])
+			.await
+			.is_err()
+	);
+}
+
+#[tokio::test]
+async fn matching_generations_reuse_one_authority_and_conflicting_declarations_are_rejected() {
+	let directory = Directory::new();
+	let (first, second) = tokio::join!(
+		SqliteRagStore::open_shared(directory.config()),
+		SqliteRagStore::open_shared(directory.config())
+	);
+	let first = first.unwrap();
+	let second = second.unwrap();
+	assert!(Arc::ptr_eq(&first, &second));
+	let id = first
+		.issue_documents(binding(), 60, DataClassification::Internal, vec![])
+		.await
+		.unwrap();
+	let mut conflict = directory.config();
+	conflict.max_documents += 1;
+	assert!(SqliteRagStore::open_shared(conflict).await.is_err());
+	assert_eq!(
+		second.classification(&id, &binding()).await.unwrap(),
+		DataClassification::Internal
+	);
+	second.revoke(&id, &binding()).await.unwrap();
+	assert_eq!(
+		first.classification(&id, &binding()).await,
+		Err(ContextError::Denied)
+	);
+}
+
+fn import_fixture(
+	dir: &Directory,
+) -> (
+	security_integration_runtime::rag_sqlite::migration::ImportConfig,
+	ContextBinding,
+	String,
+	String,
+	DocumentMetadata,
+) {
+	use base64::Engine;
+	use security_integration_runtime::{
+		SecurityConfig,
+		context_store::{LocalSecurityContextStore, SecurityContextStore},
+	};
+	let source: SecurityConfig = serde_json::from_value(serde_json::json!({"mode":"enforce", "crossComponent": {
+		"namespace":"knowledge", "maxContexts":16,
+		"storage":dir.journal("source-contexts.jsonl"),
+		"destinations":[{"classification":"public"},{"classification":"internal"},{"classification":"restricted"}]
+	}})).unwrap();
+	let mut target = source.clone();
+	let target_flow = target.cross_component.as_mut().unwrap();
+	target_flow.storage = None;
+	target_flow.sqlite = Some(dir.config());
+	let documents = DocumentLifecycleConfig {
+		namespace: "knowledge".into(),
+		storage: dir.journal("source-documents.jsonl"),
+		max_documents: 16,
+	};
+	let docs = DocumentLifecycleStore::open(documents.clone()).unwrap();
+	let mut meta = docs.begin_index(&document(), access()).unwrap();
+	docs.activate(&meta.key, meta.revision).unwrap();
+	meta.state = DocumentState::Active;
+	let flow = source.cross_component.as_ref().unwrap();
+	let contexts =
+		LocalSecurityContextStore::open(flow.storage.clone().unwrap(), &flow.namespace).unwrap();
+	contexts
+		.register_document_validator(&flow.namespace, docs.clone())
+		.unwrap();
+	let mut binding = binding();
+	binding.fingerprint =
+		base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(source.configuration_digest().unwrap());
+	let live = contexts
+		.issue_documents(
+			binding.clone(),
+			60,
+			16,
+			DataClassification::Restricted,
+			vec![reference(&meta)],
+		)
+		.unwrap();
+	let revoked = contexts
+		.issue_documents(
+			binding.clone(),
+			60,
+			16,
+			DataClassification::Restricted,
+			vec![reference(&meta)],
+		)
+		.unwrap();
+	contexts.revoke(&revoked, &binding).unwrap();
+	drop((contexts, docs));
+	let config = security_integration_runtime::rag_sqlite::migration::ImportConfig {
+		source_security: source,
+		target_security: target,
+		documents,
+	};
+	(config, binding, live, revoked, meta)
+}
+#[tokio::test]
+async fn offline_import_preserves_identity_revocation_deadlines_and_sources() {
+	use base64::Engine;
+	use security_integration_runtime::rag_sqlite::migration::import;
+	let dir = Directory::new();
+	let (config, old, live, revoked, meta) = import_fixture(&dir);
+	let paths = [
+		&config.documents.storage.path,
+		&config
+			.source_security
+			.cross_component
+			.as_ref()
+			.unwrap()
+			.storage
+			.as_ref()
+			.unwrap()
+			.path,
+	];
+	let before: Vec<_> = paths.iter().map(|p| fs::read(p).unwrap()).collect();
+	let mut new = old.clone();
+	new.fingerprint = base64::engine::general_purpose::URL_SAFE_NO_PAD
+		.encode(config.target_security.configuration_digest().unwrap());
+	let report = import(config).await.unwrap();
+	assert_eq!((report.documents, report.contexts), (1, 2));
+	assert_eq!(
+		before[0],
+		fs::read(dir.0.join("source-documents.jsonl")).unwrap()
+	);
+	assert_eq!(
+		before[1],
+		fs::read(dir.0.join("source-contexts.jsonl")).unwrap()
+	);
+	let sql = SqliteRagStore::open(dir.config()).await.unwrap();
+	assert_eq!(sql.authority_id(), meta.authority);
+	assert_eq!(sql.get_document(&meta.key).await.unwrap(), meta);
+	assert_eq!(
+		sql.classification(&live, &new).await.unwrap(),
+		DataClassification::Restricted
+	);
+	assert_eq!(
+		sql.classification(&revoked, &new).await,
+		Err(ContextError::Denied)
+	);
+	assert_eq!(
+		sql.classification(&live, &old).await,
+		Err(ContextError::Denied)
+	);
+	let mut foreign = new.clone();
+	foreign.owner = binding().owner;
+	let mut identity = foreign.owner.identity();
+	identity.tenant_id = Some("other".into());
+	foreign.owner = VerifiedOwner::from_identity(&identity, "https://issuer.example").unwrap();
+	assert_eq!(
+		sql.classification(&live, &foreign).await,
+		Err(ContextError::Denied)
+	);
+	let mut connection = external(&dir.config().path).await;
+	let raw: String = sqlx::query_scalar("SELECT snapshot FROM asp_rag_contexts WHERE id=?")
+		.bind(&live)
+		.fetch_one(&mut connection)
+		.await
+		.unwrap();
+	let old_records = String::from_utf8(before[1].clone()).unwrap();
+	let original: serde_json::Value = old_records
+		.lines()
+		.map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+		.find_map(|v| (v["change"]["snapshot"]["id"] == live).then(|| v["change"]["snapshot"].clone()))
+		.unwrap();
+	let migrated: serde_json::Value = serde_json::from_str(&raw).unwrap();
+	for field in [
+		"id",
+		"created_ms",
+		"expires_ms",
+		"ttl_seconds",
+		"classification",
+		"documents",
+		"document_authority",
+		"revoked",
+	] {
+		assert_eq!(migrated[field], original[field], "{field}");
+	}
+	connection.close().await.unwrap();
+	sql.close().await.unwrap();
+	let sql = SqliteRagStore::open(dir.config()).await.unwrap();
+	assert_eq!(
+		sql.classification(&revoked, &new).await,
+		Err(ContextError::Denied)
+	);
+	sql.close().await.unwrap();
+}
+#[tokio::test]
+async fn offline_import_rejects_security_changes_locks_and_repeated_destination() {
+	use security_integration_runtime::{
+		context_store::LocalSecurityContextStore, rag_sqlite::migration::import,
+	};
+	let dir = Directory::new();
+	let (mut config, _, _, _, _) = import_fixture(&dir);
+	config
+		.target_security
+		.cross_component
+		.as_mut()
+		.unwrap()
+		.ttl_seconds = 120;
+	assert!(
+		import(config)
+			.await
+			.unwrap_err()
+			.contains("only Context storage")
+	);
+	assert!(!dir.config().path.exists());
+	let (config, _, _, _, _) = import_fixture(&dir);
+	let source = config.source_security.cross_component.as_ref().unwrap();
+	let held =
+		LocalSecurityContextStore::open(source.storage.clone().unwrap(), &source.namespace).unwrap();
+	assert!(import(config).await.is_err());
+	assert!(!dir.config().path.exists());
+	drop(held);
+	let (config, _, _, _, _) = import_fixture(&dir);
+	import(config).await.unwrap();
+	let before = fs::read(&dir.config().path).unwrap();
+	let (config, _, _, _, _) = import_fixture(&dir);
+	assert!(
+		import(config)
+			.await
+			.unwrap_err()
+			.contains("new SQLite destination")
+	);
+	assert_eq!(before, fs::read(&dir.config().path).unwrap());
+}
+#[tokio::test]
+async fn offline_import_rejects_corrupt_journals_and_foreign_authority_without_creating_target() {
+	use security_integration_runtime::rag_sqlite::migration::import;
+	let dir = Directory::new();
+	let (config, _, _, _, _) = import_fixture(&dir);
+	let mut file = fs::OpenOptions::new()
+		.append(true)
+		.open(&config.documents.storage.path)
+		.unwrap();
+	use std::io::Write;
+	file.write_all(b"{\"partial\":").unwrap();
+	drop(file);
+	assert!(import(config).await.is_err());
+	assert!(!dir.config().path.exists());
+	let other = Directory::new();
+	let (config, _, _, _, _) = import_fixture(&other);
+	let another = Directory::new();
+	let (mut foreign, _, _, _, _) = import_fixture(&another);
+	foreign.documents = config.documents;
+	assert!(
+		import(foreign)
+			.await
+			.unwrap_err()
+			.contains("different document authorities")
+	);
+	assert!(!another.config().path.exists());
+}
+
+#[tokio::test]
+async fn offline_import_can_recover_a_full_journal_without_appending_a_checkpoint() {
+	use security_integration_runtime::{
+		context_store::LocalSecurityContextStore, rag_sqlite::migration::import,
+	};
+	use std::io::Write;
+	let dir = Directory::new();
+	let (config, _, _, _, _) = import_fixture(&dir);
+	let flow = config.source_security.cross_component.as_ref().unwrap();
+	let spec = flow.storage.as_ref().unwrap();
+	let source = fs::read_to_string(&spec.path).unwrap();
+	let mut event: serde_json::Value = serde_json::from_str(source.lines().last().unwrap()).unwrap();
+	event["change"] = serde_json::json!({"kind":"Checkpoint"});
+	let mut bytes = source.len() as u64;
+	let mut file = fs::OpenOptions::new()
+		.append(true)
+		.open(&spec.path)
+		.unwrap();
+	loop {
+		event["sequence"] = serde_json::json!(event["sequence"].as_u64().unwrap() + 1);
+		let line = format!("{}\n", serde_json::to_string(&event).unwrap());
+		if bytes + line.len() as u64 > spec.max_bytes {
+			break;
+		}
+		file.write_all(line.as_bytes()).unwrap();
+		bytes += line.len() as u64;
+	}
+	file.sync_all().unwrap();
+	drop(file);
+	let before = fs::read(&spec.path).unwrap();
+	assert!(
+		LocalSecurityContextStore::open(spec.clone(), &flow.namespace).is_err(),
+		"the legacy opener needs another durable checkpoint"
+	);
+	assert_eq!(import(config).await.unwrap().contexts, 2);
+	assert_eq!(
+		before,
+		fs::read(dir.0.join("source-contexts.jsonl")).unwrap()
+	);
+}

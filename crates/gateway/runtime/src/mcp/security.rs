@@ -142,7 +142,7 @@ impl<'a> McpSecurity<'a> {
 			return Ok(());
 		}
 		context.extensions_mut().remove::<IssuedCapability>();
-		super::dispatch::current(&context.as_request())?;
+		super::dispatch::current_async(&context.as_request().map(|_| ())).await?;
 		let op = normalize(
 			request,
 			context.security_request_id(),
@@ -154,8 +154,10 @@ impl<'a> McpSecurity<'a> {
 		}
 		if let Some(config) = self.common {
 			let http = context.as_request();
-			if let Some(flow) = crate::security_flow::prepare(config, http.headers(), http.extensions())
-				.map_err(|e| UpstreamError::InvalidRequest(e.to_string()))?
+			if let Some(flow) =
+				crate::security_flow::prepare_async(config, http.headers(), http.extensions())
+					.await
+					.map_err(|e| UpstreamError::InvalidRequest(e.to_string()))?
 			{
 				context.extensions_mut().insert(McpEgressContext {
 					server: server.into(),
@@ -168,7 +170,8 @@ impl<'a> McpSecurity<'a> {
 					server.to_owned()
 				};
 				flow
-					.check(&op.action, &destination)
+					.check_async(&op.action, &destination)
+					.await
 					.map_err(|e| UpstreamError::InvalidRequest(e.to_string()))?;
 				context.extensions_mut().insert(flow);
 			}

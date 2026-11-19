@@ -1,5 +1,5 @@
 use super::*;
-use rand::{Rng, TryRng};
+use rand::{Rng, TryRng, seq::IndexedRandom};
 use std::convert::Infallible;
 
 // Deterministic algorithm input, not a production random source.
@@ -165,21 +165,60 @@ fn weighted_draws_and_rng_advancement_match_existing_slice_algorithm() {
 #[test]
 fn invalid_weights_fail_without_fallback_or_conditional_evaluation() {
 	for weights in [vec![], vec![0, 0], vec![usize::MAX, 1]] {
-		let t = table(VirtualModelRouting::Weighted(
-			weights
+		let targets: Vec<_> = weights
+			.into_iter()
+			.map(|weight| WeightedTarget {
+				model: "x".into(),
+				weight,
+			})
+			.collect();
+		let t = table(VirtualModelRouting::Weighted(targets.clone()));
+		let mut old = Words(123);
+		let mut new = old.clone();
+		let expected = targets.choose_weighted(&mut old, |t| t.weight).unwrap_err();
+		let Err(SelectionError::InvalidWeights(error)) =
+			t.select_virtual(t.virtual_model("alias").unwrap(), |_| panic!(), || &mut new)
+		else {
+			panic!("invalid weights must not select a fallback");
+		};
+		assert_eq!(error, expected);
+		assert_eq!(Rng::next_u64(&mut old), Rng::next_u64(&mut new));
+	}
+}
+#[test]
+fn prepared_weights_are_owned_by_their_configuration_snapshot() {
+	let build = |weights: [usize; 2]| {
+		table(VirtualModelRouting::Weighted(
+			["left", "right"]
 				.into_iter()
-				.map(|weight| WeightedTarget {
-					model: "x".into(),
+				.zip(weights)
+				.map(|(model, weight)| WeightedTarget {
+					model: model.into(),
 					weight,
 				})
 				.collect(),
-		));
-		assert!(matches!(
-			t.select_virtual(t.virtual_model("alias").unwrap(), |_| panic!(), || Words(1)),
-			Err(SelectionError::InvalidWeights(_))
-		));
+		))
+	};
+	let first = build([1, 0]);
+	let cloned = first.clone();
+	let changed = build([0, 1]);
+	let mut rng = Words(31);
+	for _ in 0..64 {
+		for (table, expected) in [(&first, "left"), (&cloned, "left"), (&changed, "right")] {
+			assert_eq!(
+				table
+					.select_virtual(
+						table.virtual_model("alias").unwrap(),
+						|_| panic!(),
+						|| &mut rng
+					)
+					.unwrap(),
+				VirtualTarget::Model(expected)
+			);
+		}
 	}
 }
+
 #[test]
 fn identifiers_reject_other_snapshots_and_cloned_tables() {
 	let first = table(conditional());

@@ -302,7 +302,7 @@ fn fail_closed_does_not_read_or_populate_an_enabled_cache() {
 		DynamicPdpFailureMode::FailClosed,
 	);
 	let decision = pdp.decide(&action()).unwrap();
-	assert!(cache.entries.lock().unwrap().is_empty());
+	assert!(cache.state.lock().unwrap().entries.is_empty());
 	// An Allow left by a previously enabled cache is also ignored in FailClosed mode.
 	cache.insert(pdp.cache_key(&action()), decision, Duration::seconds(60));
 	assert!(pdp.decide(&action()).is_err());
@@ -336,7 +336,7 @@ fn cache_capacity_misses_consult_pdp_and_expiry_reclaims_space() {
 	assert!(pdp.decide(&action()).is_err());
 	assert_eq!(calls.load(Ordering::SeqCst), 2);
 	assert_eq!(
-		cache.entries.lock().unwrap().len(),
+		cache.state.lock().unwrap().entries.len(),
 		DecisionCache::MAX_ENTRIES
 	);
 	// Exercise concurrent insertion with distinct attacker-controlled keys.
@@ -356,21 +356,20 @@ fn cache_capacity_misses_consult_pdp_and_expiry_reclaims_space() {
 		}
 	});
 	assert_eq!(
-		cache.entries.lock().unwrap().len(),
+		cache.state.lock().unwrap().entries.len(),
 		DecisionCache::MAX_ENTRIES
 	);
-	cache
-		.entries
-		.lock()
-		.unwrap()
-		.get_mut("0")
-		.unwrap()
-		.expires_at = Utc::now() - Duration::seconds(1);
+	{
+		let mut state = cache.state.lock().unwrap();
+		let expiry = Utc::now() - Duration::seconds(1);
+		state.entries.get_mut("0").unwrap().expires_at = expiry;
+		state.earliest_expiry = Some(expiry);
+	}
 	cache.insert("replacement".into(), decision, Duration::minutes(1));
 	assert!(cache.get("0", Utc::now()).is_none());
 	assert!(cache.get("replacement", Utc::now()).is_some());
 	assert_eq!(
-		cache.entries.lock().unwrap().len(),
+		cache.state.lock().unwrap().entries.len(),
 		DecisionCache::MAX_ENTRIES
 	);
 }
@@ -638,4 +637,187 @@ fn approval_expiring_during_later_control_cannot_authorize() {
 		.add_action_control(Expire);
 	assert!(pipeline.authorize(&action(), Some(&json!({}))).is_err());
 	assert_eq!(sink.events().last().unwrap().decision, DecisionEffect::Deny);
+}
+
+#[test]
+fn cache_expiry_bound_preserves_live_results_across_replacement_reclamation_and_clones() {
+	fn put(
+		cache: &DecisionCache,
+		reference: &mut HashMap<String, CachedDecision>,
+		key: String,
+		expiry: DateTime<Utc>,
+		now: DateTime<Utc>,
+	) {
+		let entry = CachedDecision {
+			decision: Decision {
+				approval: None,
+				request_id: key.clone(),
+				effect: DecisionEffect::Deny,
+				policy_id: None,
+				policy_version: Some("v1".into()),
+				expires_at: Some(expiry),
+			},
+			expires_at: expiry,
+		};
+		cache
+			.state
+			.lock()
+			.unwrap()
+			.insert(key.clone(), entry.clone(), now);
+		// Previous full-scan implementation is the behavioral reference. Expired entries may
+		// now remain until capacity is needed, but live decisions and admission must match.
+		if expiry <= now {
+			return;
+		}
+		if reference.len() >= DecisionCache::MAX_ENTRIES {
+			reference.retain(|_, e| e.expires_at > now);
+		}
+		if reference.len() < DecisionCache::MAX_ENTRIES || reference.contains_key(&key) {
+			reference.insert(key, entry);
+		}
+	}
+	fn equivalent(
+		cache: &DecisionCache,
+		reference: &HashMap<String, CachedDecision>,
+		now: DateTime<Utc>,
+	) {
+		let state = cache.state.lock().unwrap();
+		assert!(state.entries.len() <= DecisionCache::MAX_ENTRIES);
+		let live = |entries: &HashMap<String, CachedDecision>| {
+			entries
+				.iter()
+				.filter(|(_, e)| e.expires_at > now)
+				.map(|(k, e)| (k.clone(), e.expires_at))
+				.collect::<std::collections::BTreeMap<_, _>>()
+		};
+		assert_eq!(live(&state.entries), live(reference));
+		if let Some(earliest) = state.entries.values().map(|e| e.expires_at).min() {
+			assert!(state.earliest_expiry.is_some_and(|bound| bound <= earliest));
+		}
+	}
+	let cache = DecisionCache::default();
+	let shared = cache.clone();
+	let mut reference = HashMap::new();
+	let base = Utc::now();
+	for i in 0..DecisionCache::MAX_ENTRIES {
+		put(
+			&cache,
+			&mut reference,
+			i.to_string(),
+			base + Duration::seconds(if i % 2 == 0 { 10 } else { 30 }),
+			base,
+		);
+	}
+	for i in 0..128 {
+		put(
+			&cache,
+			&mut reference,
+			format!("full-{i}"),
+			base + Duration::minutes(1),
+			base,
+		);
+	}
+	equivalent(&shared, &reference, base);
+	// A replacement with an earlier deadline must bring the sweep bound forward even at capacity.
+	put(
+		&cache,
+		&mut reference,
+		"1".into(),
+		base + Duration::seconds(5),
+		base,
+	);
+	assert_eq!(
+		cache.state.lock().unwrap().earliest_expiry,
+		Some(base + Duration::seconds(5))
+	);
+	let now = base + Duration::seconds(6);
+	assert!(shared.get("1", now).is_none());
+	reference.remove("1");
+	for i in 0..128 {
+		put(
+			&shared,
+			&mut reference,
+			format!("after-read-{i}"),
+			base + Duration::minutes(1),
+			now,
+		);
+	}
+	equivalent(&cache, &reference, now);
+	let now = base + Duration::seconds(11);
+	put(
+		&cache,
+		&mut reference,
+		"3".into(),
+		base + Duration::minutes(2),
+		now,
+	);
+	for i in 0..256 {
+		put(
+			&cache,
+			&mut reference,
+			format!("reclaimed-{i}"),
+			base + Duration::minutes(1),
+			now,
+		);
+	}
+	equivalent(&shared, &reference, now);
+	assert!(shared.get("0", now).is_none());
+	assert!(shared.get("3", now).is_some());
+	let now = base + Duration::minutes(3);
+	put(&cache, &mut reference, "expired-incoming".into(), now, now);
+	put(
+		&cache,
+		&mut reference,
+		"fresh".into(),
+		now + Duration::seconds(1),
+		now,
+	);
+	equivalent(&cache, &reference, now);
+	assert!(cache.get("3", now).is_none());
+	assert!(shared.get("fresh", now).is_some());
+	assert!(shared.get("fresh", now + Duration::seconds(1)).is_none());
+}
+
+#[test]
+fn enabled_cache_keeps_subject_action_resource_context_and_policy_version_isolated() {
+	let cache = DecisionCache::default();
+	let calls = Arc::new(AtomicUsize::new(0));
+	let build = |version| {
+		CachedDynamicPdp::new(
+			RemoteDynamicPdp::new(ChangingPdp(calls.clone()), Some("v1".into())),
+			cache.clone(),
+			version,
+			Duration::minutes(1),
+			DynamicPdpFailureMode::UseCachedDecision,
+		)
+	};
+	let pdp = build("v1");
+	assert!(pdp.decide(&action()).is_ok());
+	for field in [
+		"tenant",
+		"user",
+		"action",
+		"resource",
+		"session",
+		"client",
+		"delegation",
+	] {
+		let mut request = action();
+		match field {
+			"tenant" => request.subject.tenant_id = Some("tenant-b".into()),
+			"user" => request.subject.user_id = Some("bob".into()),
+			"action" => request.action.name = "other".into(),
+			"resource" => request.resource.id = "other".into(),
+			"session" => request.authorization_context.session_id = Some("other".into()),
+			"client" => request.authorization_context.client_id = Some("other".into()),
+			"delegation" => request.subject.delegation_id = Some("other".into()),
+			_ => unreachable!(),
+		}
+		assert!(
+			pdp.decide(&request).is_err(),
+			"{field} must reach the failing PDP, not reuse Allow"
+		);
+	}
+	assert!(build("v2").decide(&action()).is_err());
+	assert_eq!(calls.load(Ordering::SeqCst), 9);
 }

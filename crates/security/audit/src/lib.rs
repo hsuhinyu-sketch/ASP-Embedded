@@ -8,7 +8,10 @@ pub use journal::JsonlJournal;
 mod state_journal;
 pub use state_journal::{StateJournal, StateJournalConfig};
 mod rotating;
-pub use rotating::{AuditJournalConfig, RotatingAuditJournal};
+pub use rotating::{
+	AuditCapacityState, AuditExportFile, AuditExportReport, AuditJournalConfig, AuditJournalStatus,
+	RotatingAuditJournal,
+};
 
 pub fn event_from_decision(
 	event_id: impl Into<String>,
@@ -39,6 +42,11 @@ pub fn event_from_decision(
 /// Destination for authorization audit events. Production deployments can implement this
 /// for an event stream or durable store; the PoC uses the in-memory implementation below.
 pub trait AuditSink: Send + Sync {
+	/// Synchronous persistence must run outside the async executor. Sinks that only
+	/// publish to memory or a nonblocking tracing subscriber can opt out.
+	fn is_blocking(&self) -> bool {
+		true
+	}
 	fn record(&self, event: SecurityEvent);
 	/// Default fails closed: in-memory/tracing-only sinks cannot promise durable admission.
 	fn record_required(&self, _event: SecurityEvent) -> Result<(), String> {
@@ -47,6 +55,9 @@ pub trait AuditSink: Send + Sync {
 }
 
 impl<T: AuditSink + ?Sized> AuditSink for &T {
+	fn is_blocking(&self) -> bool {
+		(*self).is_blocking()
+	}
 	fn record_required(&self, event: SecurityEvent) -> Result<(), String> {
 		(*self).record_required(event)
 	}
@@ -71,6 +82,9 @@ impl InMemoryAuditSink {
 }
 
 impl AuditSink for InMemoryAuditSink {
+	fn is_blocking(&self) -> bool {
+		false
+	}
 	fn record(&self, event: SecurityEvent) {
 		self
 			.events

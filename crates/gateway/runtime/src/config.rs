@@ -33,8 +33,8 @@ struct TracingEnvOverrides {
 	protocol: Option<trc::Protocol>,
 }
 
-/// Use the same expansion and YAML/JSON semantics at startup and on local updates.
-pub(crate) fn parse_document(contents: &str) -> anyhow::Result<serde_json::Value> {
+/// Shared expansion and YAML/JSON semantics for startup, updates and offline commands.
+pub fn parse_document(contents: &str) -> anyhow::Result<serde_json::Value> {
 	let contents = contents.replace("# yaml-language-server: $schema", "#");
 	let contents = shellexpand::full(&contents)?;
 	serdes::yamlviajson::from_str(&contents).ctx("invalid config")
@@ -89,6 +89,9 @@ pub fn parse_config(
 	} else {
 		false
 	};
+	if raw.bind_address.is_some_and(|address| address.is_ipv6()) && !ipv6_enabled {
+		anyhow::bail!("config.bindAddress cannot use IPv6 when IPv6 is disabled");
+	}
 	let bind_wildcard = if ipv6_enabled {
 		IpAddr::V6(Ipv6Addr::UNSPECIFIED)
 	} else {
@@ -344,6 +347,7 @@ pub fn parse_config(
 		security_audit: {if raw.security_audit.is_some() && raw.security_audit_path.is_some(){anyhow::bail!("choose securityAudit or legacy securityAuditPath");}if let Some(audit)=&raw.security_audit {audit.validate().map_err(anyhow::Error::msg)?;}raw.security_audit},
 		security_audit_path: raw.security_audit_path,
 		ipv6_enabled,
+		bind_address: raw.bind_address,
 		network: network.clone().into(),
 		self_identity,
 		admin_addr,

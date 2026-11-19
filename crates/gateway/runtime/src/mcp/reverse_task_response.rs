@@ -19,7 +19,7 @@ impl ResponseTicket {
 			sent: Arc::new(AtomicBool::new(false)),
 		}
 	}
-	pub(crate) fn check(&self, access: &SessionAccess) -> Result<(), ProxyError> {
+	pub(crate) async fn check(&self, access: &SessionAccess) -> Result<(), ProxyError> {
 		if !self.parent.is_live() || Instant::now() >= self.expires {
 			return Err(access.denial("task-elicitation-response-expired"));
 		}
@@ -28,15 +28,17 @@ impl ResponseTicket {
 			.task
 			.as_ref()
 			.ok_or_else(|| access.denial("task-elicitation-response-binding"))?
-			.check(access, &self.method, "respond")?;
+			.check(access, &self.method, "respond")
+			.await?;
 		authorize_inner(
 			access,
 			&self.parent.server,
 			&self.method,
 			"respond",
 			self.method == "sampling/createMessage",
-		)?;
-		check_business(access, &self.parent)?;
+		)
+		.await?;
+		check_business(access, &self.parent).await?;
 		if !self.parent.is_live() || Instant::now() >= self.expires {
 			return Err(access.denial("task-elicitation-response-expired"));
 		}
@@ -51,7 +53,7 @@ impl ResponseTicket {
 			.get::<SessionAccess>()
 			.cloned()
 			.ok_or(ProxyError::AuthorizationFailed)?;
-		self.check(&access)?;
+		self.check(&access).await?;
 		let rpc: Value = crate::json::inspect_body(request)
 			.await
 			.map_err(|_| access.denial("task-elicitation-response-dispatch"))?;
@@ -60,7 +62,7 @@ impl ResponseTicket {
 		{
 			return Err(access.denial("task-elicitation-response-dispatch"));
 		}
-		self.check(&access)
+		self.check(&access).await
 	}
 	pub(crate) fn before_send(&self) -> Result<(), ProxyError> {
 		if !self.parent.is_live()

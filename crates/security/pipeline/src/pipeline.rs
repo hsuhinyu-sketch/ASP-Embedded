@@ -405,7 +405,47 @@ struct CachedDecision {
 /// cache misses and expired entries always go back to the PDP, and PDP failures deny by default.
 #[derive(Debug, Clone, Default)]
 pub struct DecisionCache {
-	entries: Arc<Mutex<HashMap<String, CachedDecision>>>,
+	state: Arc<Mutex<DecisionCacheState>>,
+}
+
+#[derive(Debug, Default)]
+struct DecisionCacheState {
+	entries: HashMap<String, CachedDecision>,
+	// A conservative lower bound: removing/replacing an entry may leave this earlier
+	// than necessary, but never later. Reads still check the requested entry's expiry.
+	earliest_expiry: Option<DateTime<Utc>>,
+}
+
+impl DecisionCacheState {
+	fn insert(&mut self, key: String, entry: CachedDecision, now: DateTime<Utc>) {
+		if entry.expires_at <= now {
+			return;
+		}
+		if self.entries.len() >= DecisionCache::MAX_ENTRIES && !self.entries.contains_key(&key) {
+			if self.earliest_expiry.is_none_or(|expiry| expiry <= now) {
+				let mut earliest = None;
+				self.entries.retain(|_, entry| {
+					if entry.expires_at <= now {
+						return false;
+					}
+					earliest = Some(earliest.map_or(entry.expires_at, |old: DateTime<Utc>| {
+						old.min(entry.expires_at)
+					}));
+					true
+				});
+				self.earliest_expiry = earliest;
+			}
+			if self.entries.len() >= DecisionCache::MAX_ENTRIES {
+				return;
+			}
+		}
+		self.earliest_expiry = Some(
+			self
+				.earliest_expiry
+				.map_or(entry.expires_at, |old| old.min(entry.expires_at)),
+		);
+		self.entries.insert(key, entry);
+	}
 }
 
 impl DecisionCache {
@@ -413,10 +453,10 @@ impl DecisionCache {
 	const MAX_ENTRIES: usize = 4096;
 
 	fn get(&self, key: &str, now: DateTime<Utc>) -> Option<Decision> {
-		let mut entries = self.entries.lock().expect("decision cache lock poisoned");
-		let entry = entries.get(key)?;
+		let mut state = self.state.lock().expect("decision cache lock poisoned");
+		let entry = state.entries.get(key)?;
 		if now >= entry.expires_at {
-			entries.remove(key);
+			state.entries.remove(key);
 			return None;
 		}
 		Some(entry.decision.clone())
@@ -433,23 +473,18 @@ impl DecisionCache {
 			.expires_at
 			.map(|expires_at| expires_at.min(ttl_expiry))
 			.unwrap_or(ttl_expiry);
-		if expires_at <= Utc::now() {
-			return;
-		}
-		let mut entries = self.entries.lock().expect("decision cache lock poisoned");
-		if entries.len() >= Self::MAX_ENTRIES {
-			let now = Utc::now();
-			entries.retain(|_, entry| entry.expires_at > now);
-		}
-		if entries.len() < Self::MAX_ENTRIES || entries.contains_key(&key) {
-			entries.insert(
+		self
+			.state
+			.lock()
+			.expect("decision cache lock poisoned")
+			.insert(
 				key,
 				CachedDecision {
 					decision,
 					expires_at,
 				},
+				Utc::now(),
 			);
-		}
 	}
 }
 
@@ -489,10 +524,12 @@ impl<P> CachedDynamicPdp<P> {
 			"authorizationContext": request.authorization_context,
 		});
 		let encoded = serde_json::to_vec(&material).expect("authorization cache key is serializable");
-		Sha256::digest(encoded)
-			.iter()
-			.map(|byte| format!("{byte:02x}"))
-			.collect()
+		use std::fmt::Write;
+		let mut key = String::with_capacity(64);
+		for byte in Sha256::digest(encoded) {
+			write!(key, "{byte:02x}").expect("writing to String is infallible");
+		}
+		key
 	}
 }
 

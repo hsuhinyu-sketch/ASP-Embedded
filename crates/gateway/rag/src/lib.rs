@@ -68,7 +68,7 @@ pub enum RagGatewayError {
 /// retrieval without changing the security contract.
 pub struct RagGatewayAdapter<I, R, CA> {
 	lifecycle: Option<(
-		std::sync::Arc<security_rag::lifecycle::DocumentLifecycleStore>,
+		std::sync::Arc<dyn security_rag::lifecycle::DocumentLifecycle>,
 		std::sync::Arc<dyn security_rag::lifecycle::DocumentPurger>,
 	)>,
 	ingestor: I,
@@ -89,7 +89,7 @@ impl<I, R, CA> RagGatewayAdapter<I, R, CA> {
 	}
 	pub fn with_lifecycle(
 		mut self,
-		store: std::sync::Arc<security_rag::lifecycle::DocumentLifecycleStore>,
+		store: std::sync::Arc<dyn security_rag::lifecycle::DocumentLifecycle>,
 		purger: std::sync::Arc<dyn security_rag::lifecycle::DocumentPurger>,
 	) -> Self {
 		self.lifecycle = Some((store, purger));
@@ -203,7 +203,6 @@ where
 			.await
 			.map_err(RagGatewayError::Context)?;
 		if let Some((store, _)) = &self.lifecycle {
-			use security_types::DocumentVersionValidator;
 			let references = guarded
 				.chunks
 				.iter()
@@ -214,6 +213,7 @@ where
 				.collect::<Result<Vec<_>, _>>()?;
 			store
 				.validate_documents(&subject, &references)
+				.await
 				.map_err(RagGatewayError::Lifecycle)?;
 		}
 		Ok(guarded)
@@ -265,13 +265,15 @@ where
 			Some(security_rag::lifecycle::DocumentMutation::Delete)
 		);
 		let meta = if let Some(mutation) = mutation {
-			store.mutate(
-				&key,
-				expected.ok_or_else(|| RagGatewayError::Lifecycle("expectedRevision required".into()))?,
-				mutation,
-			)
+			store
+				.mutate(
+					&key,
+					expected.ok_or_else(|| RagGatewayError::Lifecycle("expectedRevision required".into()))?,
+					mutation,
+				)
+				.await
 		} else {
-			store.get(&key)
+			store.get(&key).await
 		}
 		.map_err(RagGatewayError::Lifecycle)?;
 		let purged = if deleting {

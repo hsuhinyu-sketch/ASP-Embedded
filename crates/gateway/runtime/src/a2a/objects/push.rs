@@ -56,13 +56,14 @@ fn push_action(call: &AuthorizedCall, name: &str) -> ActionRequest {
 	action.action.name = name.into();
 	action
 }
-fn authorize(call: &AuthorizedCall, name: &str) -> Result<(), ProxyError> {
-	call.check_continuation()?;
+async fn authorize(call: &AuthorizedCall, name: &str) -> Result<(), ProxyError> {
+	call.check_continuation().await?;
 	let action = push_action(call, name);
 	crate::security::evaluate(&call.config, &action).map_err(|_| deny(&action, ObjectError::Push))?;
 	if let Some(guards) = &call.download_guards {
 		guards
 			.authorize_a2a_push(&call.config, &[&action])
+			.await
 			.map_err(|_| deny(&action, ObjectError::Push))?;
 	}
 	audit_object_check(&action, Ok(()), &UiSecurityAuditSink);
@@ -105,7 +106,11 @@ impl Channel {
 	}
 }
 impl AuthorizedCall {
-	pub(super) fn prepare_push(&mut self, req: &mut Request, rpc: &Rpc) -> Result<(), ProxyError> {
+	pub(super) async fn prepare_push(
+		&mut self,
+		req: &mut Request,
+		rpc: &Rpc,
+	) -> Result<(), ProxyError> {
 		let Some(method) = gateway_a2a::Method::parse(&rpc.method).and_then(|m| m.push_operation())
 		else {
 			return Ok(());
@@ -117,7 +122,7 @@ impl AuthorizedCall {
 			.and_then(|o| o.push.as_ref())
 			.ok_or_else(|| deny(&self.action, ObjectError::Unsupported))?;
 		let method = method.name();
-		authorize(self, method)?;
+		authorize(self, method).await?;
 		if method == "set" {
 			if self
 				.permit
@@ -209,13 +214,13 @@ impl AuthorizedCall {
 		}
 		Ok(())
 	}
-	pub(crate) fn install_push_constraints(&self) -> Result<(), ProxyError> {
+	pub(crate) async fn install_push_constraints(&self) -> Result<(), ProxyError> {
 		// Parent Guards are installed only after initial object authorization. Recheck
 		// before any upstream registration/deletion or local revocation takes effect.
 		match &self.push {
-			Some(Operation::Set(_)) => authorize(self, "set")?,
+			Some(Operation::Set(_)) => authorize(self, "set").await?,
 			Some(Operation::Delete(channel)) => {
-				authorize(self, "delete")?;
+				authorize(self, "delete").await?;
 				channel.check(&self.action)?;
 				channel.closed.store(true, Ordering::Release);
 			},
@@ -252,10 +257,10 @@ impl AuthorizedCall {
 	pub(crate) fn is_push_registration(&self) -> bool {
 		matches!(self.push, Some(Operation::Set(_)))
 	}
-	pub(crate) fn local_push_response(&self) -> Result<Option<Response>, ProxyError> {
+	pub(crate) async fn local_push_response(&self) -> Result<Option<Response>, ProxyError> {
 		let result = match &self.push {
 			Some(Operation::Get(id)) => {
-				authorize(self, "get")?;
+				authorize(self, "get").await?;
 				channels()
 					.lock()
 					.map_err(|_| deny(&self.action, ObjectError::Unavailable))?
@@ -265,7 +270,7 @@ impl AuthorizedCall {
 					.public()
 			},
 			Some(Operation::List) => {
-				authorize(self, "list")?;
+				authorize(self, "list").await?;
 				let list = channels()
 					.lock()
 					.map_err(|_| deny(&self.action, ObjectError::Unavailable))?
@@ -304,7 +309,7 @@ impl AuthorizedCall {
 						return Err(deny(&self.action, ObjectError::Push));
 					}
 				} else {
-					authorize(self, "set")?;
+					authorize(self, "set").await?;
 					let result = &rpc["result"];
 					if gateway_a2a::push::validate_registration(
 						result,
@@ -323,7 +328,8 @@ impl AuthorizedCall {
 						.proof
 						.get()
 						.ok_or_else(|| deny(&self.action, ObjectError::Push))?
-						.call(&self.action.request_id)?;
+						.call(&self.action.request_id)
+						.await?;
 					let state = call
 						.permit
 						.snapshot_state()
@@ -348,7 +354,7 @@ impl AuthorizedCall {
 				if !channel.closed.load(Ordering::Acquire) {
 					return Err(deny(&self.action, ObjectError::Push));
 				}
-				authorize(self, "delete")?;
+				authorize(self, "delete").await?;
 				if !error
 					&& (!response.status().is_success()
 						|| !gateway_a2a::push::valid_delete_result(&rpc["result"]))
@@ -378,7 +384,7 @@ impl AuthorizedCall {
 	}
 }
 impl Proof {
-	fn call(&self, request_id: &str) -> Result<AuthorizedCall, ProxyError> {
+	async fn call(&self, request_id: &str) -> Result<AuthorizedCall, ProxyError> {
 		let mut permit = self
 			.config
 			.a2a_task_store
@@ -425,7 +431,7 @@ impl Proof {
 			scope: self.scope.clone(),
 			action,
 		};
-		call.check_continuation()?;
+		call.check_continuation().await?;
 		Ok(call)
 	}
 }
@@ -541,13 +547,13 @@ pub(crate) async fn receive(mut req: Request) -> Result<Response, ProxyError> {
 		.ok_or_else(|| deny(&fallback, ObjectError::Push))?;
 	let request_id = crate::security::request_id(req.extensions_mut());
 	let work = async {
-		let mut call = proof.call(&request_id)?;
-		authorize(&call, "receive")?;
+		let mut call = proof.call(&request_id).await?;
+		authorize(&call, "receive").await?;
 		let bytes = axum::body::to_bytes(req.into_body(), settings.max_payload_bytes)
 			.await
 			.map_err(|_| deny(&call.action, ObjectError::Push))?;
 		channel.check(&call.action)?;
-		authorize(&call, "receive")?;
+		authorize(&call, "receive").await?;
 		let hash = crate::security::digest(
 			std::str::from_utf8(&bytes).map_err(|_| deny(&call.action, ObjectError::Push))?,
 		);
@@ -583,7 +589,7 @@ pub(crate) async fn receive(mut req: Request) -> Result<Response, ProxyError> {
 		// Validate and project without updating Task metadata ahead of durable event admission.
 		call.process_result_inner(&mut task, false)?;
 		call.project_event(Some(&mut task))?;
-		authorize(&call, "receive")?;
+		authorize(&call, "receive").await?;
 		channel.check(&call.action)?;
 		let mut commit_guard = CommitGuard {
 			channel: channel.clone(),
@@ -591,7 +597,7 @@ pub(crate) async fn receive(mut req: Request) -> Result<Response, ProxyError> {
 		};
 		let call = Arc::new(call);
 		call.commit_push_event(task).await?;
-		authorize(&call, "receive")?;
+		authorize(&call, "receive").await?;
 		channel.check(&call.action)?;
 		*channel
 			.last

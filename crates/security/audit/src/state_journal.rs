@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
 	fs::{File, OpenOptions},
 	io::{self, BufRead, BufReader, Read, Write},
-	path::PathBuf,
+	path::{Path, PathBuf},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,7 +123,21 @@ impl StateJournal {
 	/// Calls replay for every complete record while holding the writer lock. Never repairs.
 	pub fn open<T: DeserializeOwned>(
 		config: &StateJournalConfig,
+		replay: impl FnMut(T) -> io::Result<()>,
+	) -> io::Result<Self> {
+		Self::open_inner(config, replay, true)
+	}
+	/// Offline evidence export must not create or initialize missing source files.
+	pub(crate) fn open_existing<T: DeserializeOwned>(
+		config: &StateJournalConfig,
+		replay: impl FnMut(T) -> io::Result<()>,
+	) -> io::Result<Self> {
+		Self::open_inner(config, replay, false)
+	}
+	fn open_inner<T: DeserializeOwned>(
+		config: &StateJournalConfig,
 		mut replay: impl FnMut(T) -> io::Result<()>,
+		create: bool,
 	) -> io::Result<Self> {
 		let path = config.canonical_path()?;
 		let mut options = OpenOptions::new();
@@ -133,8 +147,19 @@ impl StateJournal {
 			use std::os::unix::fs::OpenOptionsExt;
 			options.mode(0o600);
 		}
-		let (file, fresh) = match options.open(&path) {
-			Ok(file) => (file, true),
+		let opened = if create {
+			options.open(&path)
+		} else {
+			// Use the same existing-file validation and lock acquisition below.
+			if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
+				return Err(io::Error::other(
+					"state journal must be a regular non-symlink file",
+				));
+			}
+			OpenOptions::new().read(true).append(true).open(&path)
+		};
+		let (file, fresh) = match opened {
+			Ok(file) => (file, create),
 			Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
 				if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
 					return Err(io::Error::other(
@@ -180,6 +205,28 @@ impl StateJournal {
 			}
 		}
 		Ok(journal)
+	}
+	/// Copy a validated, exclusively locked source without changing its contents.
+	pub(crate) fn copy_to(&mut self, path: &Path) -> io::Result<u64> {
+		use std::io::Seek;
+		self.check()?;
+		let mut options = OpenOptions::new();
+		options.create_new(true).write(true);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::OpenOptionsExt;
+			options.mode(0o600);
+		}
+		let mut output = options.open(path)?;
+		let mut source = self.file.try_clone()?;
+		source.rewind()?;
+		let copied = io::copy(&mut source.take(self.length), &mut output)?;
+		if copied != self.length {
+			return Err(io::Error::other("audit source changed during export"));
+		}
+		output.sync_all()?;
+		self.check()?;
+		Ok(copied)
 	}
 	pub fn is_fresh(&self) -> bool {
 		self.fresh

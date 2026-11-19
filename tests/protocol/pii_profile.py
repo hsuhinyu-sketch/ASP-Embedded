@@ -182,6 +182,19 @@ class Pii(RagLlmFixture):
         server.hold = True
         self.assert_model_denied(self.generate(*self.context()))
 
+    def test_native_cpu_timeout_prevents_model_dispatch(self):
+        self.pii.update(timeoutMs=1, maxFindings=4096,
+            policy={'entities': {'PHONE_NUMBER': {'action': 'mask'}}})
+        self.begin_pii()
+        context, _ = self.context()
+        body = {'model': 'local', 'messages': [
+            {'role': 'user', 'content': '9999999999 ' * 4096}]}
+        reply = self.call(self.gateway.model_port, '/v1/chat/completions', body, context)
+        self.assert_model_denied(reply)
+        self.assertEqual(reply[0], 503, reply)
+        audit = ''.join(p.read_text() for p in self.audit.glob('segment-*.jsonl'))
+        self.assertIn('Timeout', audit)
+
     def test_presidio_unavailable_at_startup_is_rejected(self):
         server = self.sidecar()
         server.mode = 'status'

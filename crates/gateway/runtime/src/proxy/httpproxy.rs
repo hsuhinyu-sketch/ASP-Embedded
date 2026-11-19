@@ -2299,8 +2299,14 @@ async fn build_simple_backend_call(
 				.get::<super::routing_security::Guards>()
 				.cloned()
 				.unwrap_or_default();
-			guards.ensure(&policies, req)?;
+			Box::pin(guards.ensure(&policies, req)).await?;
 			req.extensions_mut().insert(guards.clone());
+			// Complete persistent reads before taking the discovery read lock. The endpoint
+			// picker remains synchronous and side-effect free; dispatch rechecks the winner.
+			let mut candidates = Vec::with_capacity(guards.0.len());
+			for guard in &guards.0 {
+				candidates.push((guard.clone(), guard.candidate_classification().await?));
+			}
 			build_service_call_filtered(
 				inputs,
 				policies,
@@ -2310,7 +2316,7 @@ async fn build_simple_backend_call(
 				port,
 				req.uri().host(),
 				hbone_source,
-				Some(&guards),
+				Some(&candidates),
 			)?
 		},
 		SimpleBackend::Opaque(_, target) => BackendCall::from_shared(
@@ -2482,42 +2488,53 @@ async fn make_backend_call(
 				let mut accepted = std::collections::HashMap::new();
 				let mut rejected_candidate = None;
 				let mut denied = None;
-				let selected = ai.select_provider_where(|candidate| {
-					let result = super::routing_security::provider(
-						&inputs,
-						n,
-						&Arc::new(candidate.clone()),
-						&policies,
-						&route_policies,
-						&req,
-					)
-					.and_then(|(guards, target)| {
+				// Resolve live Context constraints before the synchronous health picker. Only
+				// exact provider instances from this pass are eligible; dispatch reauthorizes.
+				let routing_request = super::routing_security::request_head(&req);
+				for (candidate, _) in ai.providers.eligible_active(|_| true) {
+					let result = async {
+						let (guards, target) = Box::pin(super::routing_security::provider(
+							&inputs,
+							n,
+							&candidate,
+							&policies,
+							&route_policies,
+							&routing_request,
+						))
+						.await?;
 						for guard in &guards {
-							if let Err(denial) = guard.prefilter(target.as_ref()) {
+							if let Err(denial) = guard.prefilter_async(target.as_ref()).await {
 								rejected_candidate = Some((guard.clone(), denial));
 								return Err(ProxyError::AuthorizationFailed);
 							}
 						}
 						Ok(guards)
-					});
+					}
+					.await;
 					match result {
 						Ok(guards) => {
-							accepted.insert(candidate.name.clone(), guards);
-							true
+							accepted.insert(candidate.name.clone(), (candidate, guards));
 						},
 						Err(error) => {
 							denied = Some(error);
-							false
 						},
 					}
+				}
+				let selected = ai.select_provider_where(|candidate| {
+					accepted
+						.get(&candidate.name)
+						.is_some_and(|(prepared, _)| std::ptr::eq(candidate, prepared.as_ref()))
 				});
+
 				let (provider, handle) = selected.ok_or_else(|| {
 					if let Some((guard, denial)) = rejected_candidate {
 						return guard.reject_candidate(denial);
 					}
 					denied.unwrap_or(ProxyError::NoHealthyEndpoints)
 				})?;
-				let guards = accepted.remove(&provider.name).unwrap_or_default();
+				let (_, guards) = accepted
+					.remove(&provider.name)
+					.expect("selected prepared provider");
 				(provider, handle, guards)
 			};
 			req
@@ -2727,7 +2744,7 @@ async fn make_backend_call(
 		.get::<super::routing_security::Guards>()
 		.cloned()
 		.unwrap_or_default();
-	guards.ensure(&backend_call.backend_policies, &req)?;
+	guards.ensure(&backend_call.backend_policies, &req).await?;
 	if !guards.0.is_empty() {
 		req.extensions_mut().insert(guards);
 	}
@@ -2766,15 +2783,15 @@ async fn make_backend_call(
 		.get::<crate::mcp::McpEgressContext>()
 		.cloned()
 		.map(Box::new);
-	let flow = backend_call
-		.backend_policies
-		.security_audit
-		.as_ref()
-		.map(|config| crate::security_flow::prepare(config, req.headers(), req.extensions()))
-		.transpose()
-		.map_err(ProxyResponse::from)?
-		.flatten()
-		.map(Box::new);
+	let flow = if let Some(config) = &backend_call.backend_policies.security_audit {
+		crate::security_flow::prepare_async(config, req.headers(), req.extensions())
+			.await
+			.map_err(ProxyResponse::from)?
+			.map(Box::new)
+	} else {
+		None
+	};
+
 	let routing_guards = req
 		.extensions()
 		.get::<super::routing_security::Guards>()
@@ -2959,7 +2976,7 @@ async fn make_backend_call(
 		Box::pin(guard.dispatch(&backend_call.target)).await?;
 	}
 	for guard in routing_guards.iter().flat_map(|guards| guards.0.iter()) {
-		guard.check_response_current(&backend_call.target)?;
+		guard.check_response_current(&backend_call.target).await?;
 	}
 	if let Some(flow) = &flow {
 		let destination = backend_call.target.to_string();
@@ -2976,13 +2993,14 @@ async fn make_backend_call(
 				mcp.server.clone()
 			};
 			flow
-				.check(&mcp.action, &target)
+				.check_async(&mcp.action, &target)
+				.await
 				.map_err(ProxyResponse::from)?;
 		}
 		if let Some(model) = backend_call.backend_policies.model_name() {
 			recognized = true;
 			flow
-				.check(
+				.check_async(
 					&security_pipeline::model_invoke_for_identity(
 						egress_request_id.clone(),
 						egress_identity.clone(),
@@ -2990,12 +3008,13 @@ async fn make_backend_call(
 					),
 					&destination,
 				)
+				.await
 				.map_err(ProxyResponse::from)?;
 		}
 		if backend_call.backend_policies.inference_routing.is_some() {
 			recognized = true;
 			flow
-				.check(
+				.check_async(
 					&security_pipeline::inference_route_for_identity(
 						egress_request_id.clone(),
 						egress_identity.clone(),
@@ -3003,13 +3022,14 @@ async fn make_backend_call(
 					),
 					&destination,
 				)
+				.await
 				.map_err(ProxyResponse::from)?;
 		}
 		#[cfg(feature = "gateway-a2a")]
 		if backend_call.backend_policies.a2a.is_some() {
 			recognized = true;
 			flow
-				.check(
+				.check_async(
 					&security_pipeline::agent_invoke_for_identity(
 						egress_request_id.clone(),
 						egress_identity.clone(),
@@ -3017,6 +3037,7 @@ async fn make_backend_call(
 					),
 					&destination,
 				)
+				.await
 				.map_err(ProxyResponse::from)?;
 		}
 		if !recognized {
@@ -3235,8 +3256,8 @@ async fn make_backend_call(
 			))
 			.await?,
 		);
-		call.install_push_constraints()?;
-		if let Some(response) = call.local_push_response()? {
+		call.install_push_constraints().await?;
+		if let Some(response) = call.local_push_response().await? {
 			return Ok(response);
 		}
 		if let Some(response) = call.recovery_response().await? {
@@ -3361,6 +3382,12 @@ async fn make_backend_call(
 		} else {
 			None
 		};
+	// Another guard or transport preparation may have awaited after this guard authorized.
+	for guard in routing_guards.iter().flat_map(|guards| guards.0.iter()) {
+		guard.check_response_current(&response_target).await?;
+	}
+	#[cfg(feature = "gateway-mcp")]
+	crate::mcp::dispatch::authorize_send(&super::routing_security::request_head(&call.req)).await?;
 	#[cfg(feature = "gateway-a2a")]
 	if let Some(cleanup) = &mut cleanup_call {
 		if let Some(response) = cleanup.before_send()? {
@@ -3369,10 +3396,6 @@ async fn make_backend_call(
 	}
 	#[cfg(feature = "gateway-mcp")]
 	crate::mcp::dispatch::before_send(&call.req)?;
-	// Another guard or transport preparation may have awaited after this guard authorized.
-	for guard in routing_guards.iter().flat_map(|guards| guards.0.iter()) {
-		guard.check_response_current(&response_target)?;
-	}
 	let resp = if let Some(scope) = &execution_scope {
 		Box::pin(scope.run_for(
 			&execution_action.as_ref().expect("budget action").1,
@@ -3418,7 +3441,7 @@ async fn make_backend_call(
 	}
 	let mut resp = resp?;
 	if let Some(guards) = &routing_guards {
-		resp = guards.protect_response(resp, &response_target)?;
+		resp = guards.protect_response(resp, &response_target).await?;
 	}
 
 	// Wrap the raw upstream body so buffering/adaptation also obeys the shared deadline.
@@ -3508,7 +3531,7 @@ async fn make_backend_call(
 		dtrace::snapshot!(Response, "backend response ready", log, &resp);
 	}
 	if let Some(guards) = &routing_guards {
-		resp = guards.protect_response(resp, &response_target)?;
+		resp = guards.protect_output(resp, &response_target).await?;
 	}
 	let response_body_limit = crate::http::response_buffer_limit(&resp);
 	let resp = resp.map(|b| dtrace::TracingBody::maybe_wrap("response", b, response_body_limit));
@@ -3603,7 +3626,12 @@ fn build_service_call_filtered(
 	port: &u16,
 	request_host: Option<&str>,
 	hbone_source: Option<HboneSourceRole>,
-	guards: Option<&super::routing_security::Guards>,
+	guards: Option<
+		&[(
+			Arc<super::routing_security::Guard>,
+			Option<security_types::DataClassification>,
+		)],
+	>,
 ) -> Result<BackendCall, ProxyError> {
 	let port = *port;
 	let http_version_override = if svc.port_is_http2(port) {
@@ -3629,7 +3657,7 @@ fn build_service_call_filtered(
 	let discovery = inputs.stores.read_discovery();
 	let workloads = &discovery.workloads;
 	let mut denied = None;
-	let selected = if let Some(guards) = guards.filter(|g| !g.0.is_empty()) {
+	let selected = if let Some(guards) = guards.filter(|g| !g.is_empty()) {
 		svc.endpoints.select_endpoint_where(
 			workloads,
 			svc,
@@ -3656,8 +3684,8 @@ fn build_service_call_filtered(
 				} else {
 					return false;
 				};
-				for guard in &guards.0 {
-					if let Err(denial) = guard.prefilter(Some(&target)) {
+				for (guard, class) in guards {
+					if let Err(denial) = guard.prefilter_classification(Some(&target), *class) {
 						denied = Some((guard.clone(), denial));
 						return false;
 					}

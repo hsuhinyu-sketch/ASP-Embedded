@@ -25,8 +25,9 @@ use crate::{
 /// Rechecks must include the originating protocol operation and its live parent.
 /// No cached boolean can stand in for these checks.
 pub(crate) trait Guard: Send + Sync {
-	fn check(&self) -> Result<(), ProxyError>;
-	fn correlate(&self, request_id: String) -> Result<(), ProxyError>;
+	fn check(&self) -> ExecutionFuture<'_, (), ProxyError>;
+	fn current(&self) -> Result<(), ProxyError>;
+	fn correlate(&self, request_id: String) -> ExecutionFuture<'_, (), ProxyError>;
 	fn denial(&self, reason: &str) -> ProxyError;
 }
 
@@ -196,7 +197,7 @@ impl Call {
 		request: &mut Request,
 		policies: &BackendPolicies,
 	) -> Result<(), ProxyError> {
-		self.binding.guard.check()?;
+		self.binding.guard.check().await?;
 		let active = policies
 			.security_audit
 			.as_ref()
@@ -236,15 +237,18 @@ impl Call {
 					.denial("task-sampling-final-model-request"),
 			);
 		}
-		self.binding.guard.check()
+		self.binding.guard.check().await
 	}
 
 	pub(crate) fn before_send(&self) -> Result<(), ProxyError> {
-		self.binding.guard.check()?;
+		self.binding.guard.current()?;
 		if self.state.model.get().is_none() || self.state.sent.swap(true, Ordering::AcqRel) {
 			return Err(self.binding.guard.denial("task-sampling-model-replay"));
 		}
 		Ok(())
+	}
+	pub(crate) async fn authorize_send(&self) -> Result<(), ProxyError> {
+		self.binding.guard.check().await
 	}
 }
 
@@ -276,7 +280,7 @@ impl BoundTextGeneration for Bound {
 
 	fn generate(&self, input: TextRequest) -> ExecutionFuture<'_, TextResponse, ProxyError> {
 		Box::pin(async move {
-			self.binding.guard.check()?;
+			self.binding.guard.check().await?;
 			if self.claimed.swap(true, Ordering::AcqRel) {
 				return Err(self.binding.guard.denial("task-sampling-model-replay"));
 			}
@@ -323,7 +327,7 @@ impl BoundTextGeneration for Bound {
 				request.extensions_mut().insert(guards.clone());
 			}
 			let request_id = crate::security::request_id(request.extensions_mut());
-			self.binding.guard.correlate(request_id)?;
+			self.binding.guard.correlate(request_id).await?;
 			request
 				.extensions_mut()
 				.insert(self.binding.revision.clone());
@@ -361,7 +365,7 @@ impl BoundTextGeneration for Bound {
 				.ok_or(ProxyError::AuthorizationFailed)?;
 			let result = decode_response(&generated, model)
 				.ok_or_else(|| self.binding.guard.denial("task-sampling-output-shape"))?;
-			self.binding.guard.check()?;
+			self.binding.guard.check().await?;
 			Ok(result)
 		})
 	}

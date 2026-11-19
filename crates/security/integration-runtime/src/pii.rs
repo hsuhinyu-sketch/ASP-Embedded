@@ -110,6 +110,44 @@ impl PreparedPii {
 mod tests {
 	use super::*;
 	use serde_json::json;
+	#[cfg(feature = "pii")]
+	#[test]
+	fn cancelled_preparation_keeps_engine_unavailable_until_retry_finishes() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.max_blocking_threads(1)
+			.enable_all()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let (release, wait) = std::sync::mpsc::channel();
+			let (started, running) = tokio::sync::oneshot::channel();
+			let occupied = tokio::task::spawn_blocking(move || {
+				let _ = started.send(());
+				let _ = wait.recv();
+			});
+			running.await.unwrap();
+			let config: PiiConfiguration = serde_json::from_value(json!({
+				"policy":{"entities":{"PHONE_NUMBER":{"action":"mask"}}}
+			}))
+			.unwrap();
+			let handle = std::sync::Arc::new(PreparedPii::default());
+			handle.validate(Some(&config)).unwrap();
+			let preparing = {
+				let (handle, config) = (handle.clone(), config.clone());
+				tokio::spawn(async move { handle.prepare(&config).await })
+			};
+			tokio::task::yield_now().await;
+			let premature = preparing.is_finished() || handle.get(&config).is_some();
+			preparing.abort();
+			let cancelled = preparing.await.unwrap_err().is_cancelled();
+			release.send(()).unwrap();
+			occupied.await.unwrap();
+			assert!(!premature && cancelled);
+			assert!(handle.get(&config).is_none());
+			handle.prepare(&config).await.unwrap();
+			assert!(handle.get(&config).is_some());
+		});
+	}
 	#[test]
 	fn security_configuration_keeps_pii_in_the_fingerprint_and_rejects_runtime_handles() {
 		let config: crate::SecurityConfig =

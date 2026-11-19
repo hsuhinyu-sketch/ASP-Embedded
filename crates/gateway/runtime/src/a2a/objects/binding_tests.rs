@@ -2,8 +2,8 @@ use super::*;
 use gateway_rag::http::ContextConstraintIssuer;
 use security_integration_runtime::a2a_objects::{A2aObjectConfig, TaskStore};
 
-#[test]
-fn task_metadata_rejects_replaced_or_removed_context_even_with_the_same_owner() {
+#[tokio::test]
+async fn task_metadata_rejects_replaced_or_removed_context_even_with_the_same_owner() {
 	let config: SecurityConfig = serde_json::from_value(serde_json::json!({
 			"mode":"enforce", "policies":[{"id":"allow","enabled":true,"effect":"allow"}],
 			"crossComponent":{"namespace":uuid::Uuid::new_v4().to_string(),"destinations":[
@@ -30,32 +30,32 @@ fn task_metadata_rejects_replaced_or_removed_context_even_with_the_same_owner() 
 		findings: vec![],
 	};
 	let mut gates = Vec::new();
-	let flows = (0..2)
-		.map(|_| {
-			let id = issuer.issue(&guarded, None).unwrap();
-			let mut headers = ::http::HeaderMap::new();
-			headers.insert(crate::security_flow::HEADER, id.parse().unwrap());
-			let flow = crate::security_flow::prepare(&config, &headers, &extensions)
-				.unwrap()
-				.unwrap();
-			let mut request = Request::default();
-			*request.headers_mut() = headers;
-			*request.extensions_mut() = extensions.clone();
-			let mut guards = crate::proxy::RoutingGuards::default();
-			guards
-				.ensure(
-					&crate::store::BackendPolicies {
-						a2a: Some(crate::types::agent::A2aPolicy {}),
-						security_audit: Some(config.clone()),
-						..Default::default()
-					},
-					&request,
-				)
-				.unwrap();
-			gates.push(guards);
-			flow
-		})
-		.collect::<Vec<_>>();
+	let mut flows = Vec::new();
+	for _ in 0..2 {
+		let id = issuer.issue(&guarded, None).unwrap();
+		let mut headers = ::http::HeaderMap::new();
+		headers.insert(crate::security_flow::HEADER, id.parse().unwrap());
+		let flow = crate::security_flow::prepare(&config, &headers, &extensions)
+			.unwrap()
+			.unwrap();
+		let mut request = Request::default();
+		*request.headers_mut() = headers;
+		*request.extensions_mut() = extensions.clone();
+		let mut guards = crate::proxy::RoutingGuards::default();
+		guards
+			.ensure(
+				&crate::store::BackendPolicies {
+					a2a: Some(crate::types::agent::A2aPolicy {}),
+					security_audit: Some(config.clone()),
+					..Default::default()
+				},
+				&request,
+			)
+			.await
+			.unwrap();
+		gates.push(guards);
+		flows.push(flow);
+	}
 	let identity = crate::security::identity_from_extensions(&extensions);
 	for budget in [None, Some(crate::security::digest("execution"))] {
 		let store = Arc::new(TaskStore::default());

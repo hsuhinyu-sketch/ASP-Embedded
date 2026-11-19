@@ -1,0 +1,75 @@
+# Cargo features: gateway-a2a,security-s1,security-a2a-sqlite,tls-aws-lc
+# Setup and port map: docs/README.md#安全网关场景-profile
+config:
+  bindAddress: 127.0.0.1
+  management:
+    mode: edge
+  securityAudit:
+    directory: ${AISP_EXAMPLE_STATE_DIR}/agent-gateway/audit
+aiSystems:
+  - name: agent-gateway
+    security:
+      mode: enforce
+      requiredIdentity:
+        user: true
+        tenant: true
+        agent: false
+      requiredAudit:
+        actionTypes:
+          - agentInvoke
+      policies:
+        - id: invoke-fixed-agent
+          tenantId: tenant-a
+          actionType: agentInvoke
+          effect: allow
+          enabled: true
+          resourceType: agent
+          resourceId: 127.0.0.1:18100
+        - id: create-own-task
+          tenantId: tenant-a
+          actionType: agentTaskOperation
+          effect: allow
+          enabled: true
+          actionName: create
+          resourceType: agent
+          resourceId: '["127.0.0.1:18100","/"]'
+        - id: read-own-task
+          tenantId: tenant-a
+          actionType: agentTaskOperation
+          effect: allow
+          enabled: true
+          actionName: read
+          resourceType: agentTask
+      a2aObjects:
+        storage:
+          type: sqlite
+          path: ${AISP_EXAMPLE_STATE_DIR}/agent-gateway/tasks.sqlite
+          namespace: agent-gateway
+          busyTimeoutMillis: 100
+        maxTasks: 256
+        retentionSeconds: 86400
+        maxStreams: 16
+      dataEgress:
+        classification: internal
+        agentDestinations:
+          - 127.0.0.1:18100
+    a2a:
+      port: 14101
+      backend:
+        host: 127.0.0.1:18100
+policies:
+  - name:
+      name: agent-gateway-jwt
+      namespace: internal
+    target:
+      route:
+        name: ai-system:agent-gateway:a2a:request
+        namespace: internal
+    policy:
+      jwtAuth:
+        mode: strict
+        issuer: ${AISP_EXAMPLE_ISSUER}
+        audiences:
+          - agent-gateway
+        jwks:
+          file: ${AISP_EXAMPLE_JWKS_FILE}

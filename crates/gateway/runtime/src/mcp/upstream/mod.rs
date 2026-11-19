@@ -72,6 +72,10 @@ impl IncomingRequestContext {
 	}
 	pub fn apply(&self, req: &mut http::Request) -> anyhow::Result<()> {
 		req.extensions_mut().extend(self.ext.clone());
+		let restricted = self
+			.ext
+			.get::<crate::security_flow::FlowAccess>()
+			.is_some_and(crate::security_flow::FlowAccess::restricts_untrusted_payloads);
 		let explicit_auto_hostname = req
 			.extensions()
 			.get::<crate::http::filters::AutoHostname>()
@@ -88,6 +92,9 @@ impl IncomingRequestContext {
 			}
 		}
 		for (k, v) in &self.headers {
+			if restricted && k.as_str() != gateway_mcp::protocol::HEADER_MCP_PROTOCOL_VERSION {
+				continue;
+			}
 			// Remove headers we do not want to propagate to the backend
 			if k == http::header::CONTENT_ENCODING
 				|| k.as_str() == crate::execution_budget::INVOCATION_HEADER
@@ -114,7 +121,7 @@ impl IncomingRequestContext {
 				.headers_mut()
 				.insert(CAPABILITY_CONTEXT_HEADER, capability.context.clone());
 		}
-		let Some(authority) = self.authority.clone() else {
+		let Some(authority) = self.authority.clone().filter(|_| !restricted) else {
 			return Ok(());
 		};
 		http::modify_req_uri(req, |uri| {

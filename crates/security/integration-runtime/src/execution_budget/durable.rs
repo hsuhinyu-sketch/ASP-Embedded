@@ -383,7 +383,7 @@ impl DurableExecutionBudgetStore {
 				.0
 				.lock()
 				.map_err(|_| "execution table unavailable")?
-				.insert(record.id.clone(), record);
+				.insert(record);
 		}
 		let mut journal = Journal {
 			file,
@@ -591,6 +591,7 @@ impl ExecutionBudgetStore for DurableExecutionBudgetStore {
 			.0
 			.lock()
 			.map_err(|_| BudgetError::Unavailable)?
+			.records
 			.get(handle.id())
 			.cloned()
 			.ok_or(BudgetError::Unavailable)?;
@@ -601,15 +602,18 @@ impl ExecutionBudgetStore for DurableExecutionBudgetStore {
 		state.persist(&record)?;
 		record.check_active()?;
 		// Bound metadata as well as the core table; no old records can regain a new deadline.
-		let live = state
-			.memory
-			.0
-			.lock()
-			.map_err(|_| BudgetError::Unavailable)?
-			.keys()
-			.cloned()
-			.collect::<std::collections::HashSet<_>>();
-		state.expirations.retain(|id, _| live.contains(id));
+		let State {
+			memory,
+			expirations,
+			..
+		} = &mut *state;
+		let live = memory.0.lock().map_err(|_| BudgetError::Unavailable)?;
+		// Every live record has an expiration after recovery/admission. Only a reap can
+		// leave extra expiration keys; avoid scanning unchanged metadata after every create.
+		if expirations.len() != live.records.len() {
+			expirations.retain(|id, _| live.records.contains_key(id));
+		}
+		drop(live);
 		Ok(self.wrap(record))
 	}
 	fn resolve(
@@ -643,6 +647,7 @@ impl ExecutionBudgetStore for DurableExecutionBudgetStore {
 			.0
 			.lock()
 			.map_err(|_| BudgetError::Unavailable)?
+			.records
 			.get(id)
 			.cloned()
 			.ok_or(BudgetError::InvalidContext)?;

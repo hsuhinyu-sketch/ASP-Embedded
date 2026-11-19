@@ -170,6 +170,9 @@ pub struct RawConfig {
 	pub(crate) dependency_egress:
 		Option<security_integration_runtime::dependency_egress::DependencyEgressConfig>,
 	enable_ipv6: Option<bool>,
+	/// Address for local-config protocol listeners; defaults to the existing wildcard address.
+	/// Management, metrics, readiness and the separately mounted RAG listener use their own addresses.
+	bind_address: Option<std::net::IpAddr>,
 
 	/// DNS resolver settings.
 	dns: Option<RawDnsConfig>,
@@ -548,6 +551,7 @@ pub struct Config {
 	#[serde(skip)]
 	pub(crate) startup_config: config::StartupConfig,
 	pub ipv6_enabled: bool,
+	pub bind_address: Option<std::net::IpAddr>,
 	pub network: Strng,
 	/// How the gateway discovers its own workload for locality-aware load balancing.
 	/// `None` disables locality filtering — any LoadBalancer config on services is ignored.

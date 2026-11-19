@@ -188,7 +188,7 @@ pub(crate) fn parent(
 	.map(Some)
 }
 
-pub(crate) fn task_parent(
+pub(crate) async fn task_parent(
 	access: &SessionAccess,
 	server: &str,
 	request: Option<&JsonRpcRequest<ClientRequest>>,
@@ -197,7 +197,8 @@ pub(crate) fn task_parent(
 	let Some(request) = request else {
 		return Ok(None);
 	};
-	let Some((task, lease)) = super::tasks::interaction::Link::attach(ticket, access, server)? else {
+	let Some((task, lease)) = super::tasks::interaction::Link::attach(ticket, access, server).await?
+	else {
 		return Ok(None);
 	};
 	security_audit::StateJournal::encoded_len(&request.id, 512)
@@ -265,22 +266,22 @@ fn install_parent(
 	})
 }
 
-fn authorize(
+async fn authorize(
 	access: &SessionAccess,
 	server: &str,
 	method: &str,
 	phase: &str,
 ) -> Result<security_types::ActionRequest, ProxyError> {
-	authorize_inner(access, server, method, phase, false)
+	authorize_inner(access, server, method, phase, false).await
 }
-fn authorize_inner(
+async fn authorize_inner(
 	access: &SessionAccess,
 	server: &str,
 	method: &str,
 	phase: &str,
 	managed: bool,
 ) -> Result<security_types::ActionRequest, ProxyError> {
-	access.check()?;
+	access.check().await?;
 	// Sampling asks the downstream client to run inference outside this process.
 	// MCP server egress does not prove its actual model destination or debit this
 	// workflow's model budget. Refuse protected flows until that adapter exists.
@@ -304,7 +305,7 @@ fn authorize_inner(
 		.authorize(&action, None)
 		.map_err(|_| access.denial("reverse-authorization"))?;
 	if let Some(flow) = &access.flow {
-		flow.check(&action, server)?;
+		flow.check_async(&action, server).await?;
 	}
 	if let Some(egress) = &access.config.data_egress {
 		security_integration_runtime::check_data_egress(
@@ -324,12 +325,12 @@ fn authorize_inner(
 		return Err(access.denial("reverse-authorization-expired"));
 	}
 	if let Some(flow) = &access.flow {
-		flow.current()?;
+		flow.current_async().await?;
 	}
 	Ok(action)
 }
 
-fn check_business(access: &SessionAccess, parent: &Parent) -> Result<(), ProxyError> {
+async fn check_business(access: &SessionAccess, parent: &Parent) -> Result<(), ProxyError> {
 	let (action, args) = parent.business.as_ref();
 	access
 		.security()
@@ -345,7 +346,7 @@ fn check_business(access: &SessionAccess, parent: &Parent) -> Result<(), ProxyEr
 		parent.server.clone()
 	};
 	if let Some(flow) = &access.flow {
-		flow.check(action, &destination)?;
+		flow.check_async(action, &destination).await?;
 	}
 	if let Some(egress) = &access.config.data_egress {
 		security_integration_runtime::check_data_egress(
@@ -359,7 +360,7 @@ fn check_business(access: &SessionAccess, parent: &Parent) -> Result<(), ProxyEr
 	Ok(())
 }
 
-pub(crate) fn request(
+pub(crate) async fn request(
 	access: &SessionAccess,
 	parent: Option<&ParentLease>,
 	message: &mut ServerJsonRpcMessage,
@@ -420,8 +421,8 @@ pub(crate) fn request(
 		{
 			return Err(access.denial("task-reverse-association"));
 		}
-		task.check(access, &method, "request")?;
-		check_business(access, parent)?;
+		task.check(access, &method, "request").await?;
+		check_business(access, parent).await?;
 	} else if params
 		.get("_meta")
 		.and_then(|m| m.get("io.modelcontextprotocol/related-task"))
@@ -464,7 +465,8 @@ pub(crate) fn request(
 		&method,
 		"request",
 		parent.task.is_some() && method == "sampling/createMessage",
-	)?;
+	)
+	.await?;
 	let id = uuid::Uuid::new_v4().to_string();
 	let mut clean = params.clone();
 	clean.as_object_mut().expect("validated").remove("_meta");
@@ -517,7 +519,7 @@ pub(crate) fn request(
 }
 
 /// Consumes the correlation before network IO. Errors are projected without upstream data.
-pub(crate) fn response(
+pub(crate) async fn response(
 	access: &SessionAccess,
 	message: ClientJsonRpcMessage,
 ) -> Result<
@@ -529,9 +531,9 @@ pub(crate) fn response(
 	),
 	ProxyError,
 > {
-	response_inner(access, message, false)
+	response_inner(access, message, false).await
 }
-fn response_inner(
+async fn response_inner(
 	access: &SessionAccess,
 	message: ClientJsonRpcMessage,
 	managed: bool,
@@ -544,7 +546,7 @@ fn response_inner(
 	),
 	ProxyError,
 > {
-	access.check()?;
+	access.check().await?;
 	if security_audit::StateJournal::encoded_len(&message, 16384).is_err() {
 		return Err(access.denial("reverse-size"));
 	}
@@ -561,32 +563,34 @@ fn response_inner(
 	let id = rpc["id"]
 		.as_str()
 		.ok_or_else(|| access.denial("reverse-unknown-response"))?;
-	let state = binding
-		.reverse
-		.lock()
-		.map_err(|_| access.denial("reverse-unavailable"))?;
-	let (candidate, method) = state
-		.pending
-		.get(id)
-		.and_then(|p| p.parent.upgrade().map(|parent| (parent, p.method.clone())))
-		.ok_or_else(|| access.denial("reverse-unknown-response"))?;
-	drop(state);
+	let (candidate, method) = {
+		let state = binding
+			.reverse
+			.lock()
+			.map_err(|_| access.denial("reverse-unavailable"))?;
+		state
+			.pending
+			.get(id)
+			.and_then(|p| p.parent.upgrade().map(|parent| (parent, p.method.clone())))
+			.ok_or_else(|| access.denial("reverse-unknown-response"))?
+	};
 	if method == "sampling/createMessage" && candidate.task.is_some() && !managed {
 		return Err(access.denial("task-sampling-requires-gateway-result"));
 	}
 	// A different workflow must not consume another workflow's legitimate question.
 	if let Some(task) = &candidate.task {
-		task.check(access, &method, "respond")?;
+		task.check(access, &method, "respond").await?;
 	}
-	let mut state = binding
-		.reverse
-		.lock()
-		.map_err(|_| access.denial("reverse-unavailable"))?;
-	let pending = state
-		.pending
-		.remove(id)
-		.ok_or_else(|| access.denial("reverse-unknown-response"))?;
-	drop(state);
+	let pending = {
+		let mut state = binding
+			.reverse
+			.lock()
+			.map_err(|_| access.denial("reverse-unavailable"))?;
+		state
+			.pending
+			.remove(id)
+			.ok_or_else(|| access.denial("reverse-unknown-response"))?
+	};
 	let parent = pending
 		.parent
 		.upgrade()
@@ -595,14 +599,14 @@ fn response_inner(
 	if pending.expires <= Instant::now() {
 		return Err(access.denial("reverse-expired"));
 	}
-	let action = authorize_inner(access, &parent.server, &pending.method, "respond", managed)?;
+	let action = authorize_inner(access, &parent.server, &pending.method, "respond", managed).await?;
 	if let Some(task) = &parent.task {
-		task.check(access, &pending.method, "respond")?;
+		task.check(access, &pending.method, "respond").await?;
 		if rpc.get("error").is_some() || !task.valid_meta(&rpc["result"]["_meta"], false) {
 			return Err(access.denial("task-elicitation-response-association"));
 		}
 	}
-	check_business(access, &parent)?;
+	check_business(access, &parent).await?;
 	if !parent.is_live() || pending.expires <= Instant::now() {
 		return Err(access.denial("reverse-parent-closed-or-expired"));
 	}
@@ -643,11 +647,11 @@ fn response_inner(
 }
 
 /// Only a currently-owned originating request may be cancelled. No unbounded fanout.
-pub(crate) fn cancel(
+pub(crate) async fn cancel(
 	access: &SessionAccess,
 	message: &rmcp::model::ClientNotification,
 ) -> Result<String, ProxyError> {
-	access.check()?;
+	access.check().await?;
 	if access.limits.reverse.is_none() {
 		return Err(access.denial("reverse-disabled"));
 	}
@@ -658,22 +662,23 @@ pub(crate) fn cancel(
 		.binding
 		.as_ref()
 		.ok_or_else(|| access.denial("reverse-requires-session"))?;
-	let state = binding
-		.reverse
-		.lock()
-		.map_err(|_| access.denial("reverse-unavailable"))?;
-	let parents: Vec<_> = state
-		.parents
-		.values()
-		.filter_map(Weak::upgrade)
-		.filter(|p| p.id == id && p.is_live())
-		.collect();
-	drop(state);
+	let parents: Vec<_> = {
+		let state = binding
+			.reverse
+			.lock()
+			.map_err(|_| access.denial("reverse-unavailable"))?;
+		state
+			.parents
+			.values()
+			.filter_map(Weak::upgrade)
+			.filter(|p| p.id == id && p.is_live())
+			.collect()
+	};
 	if parents.len() != 1 {
 		return Err(access.denial("reverse-unknown-or-ambiguous-cancel"));
 	}
 	let parent = &parents[0];
-	authorize(access, &parent.server, "notifications/cancelled", "request")?;
+	authorize(access, &parent.server, "notifications/cancelled", "request").await?;
 	if !parent.is_live() {
 		return Err(access.denial("reverse-parent-closed"));
 	}

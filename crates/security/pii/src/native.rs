@@ -3,10 +3,44 @@ use phonenumber::country;
 use regex::Regex;
 use std::net::IpAddr;
 
+const PHONE_REGIONS: [country::Id; 7] = [
+	country::CN,
+	country::US,
+	country::GB,
+	country::DE,
+	country::IN,
+	country::CA,
+	country::BR,
+];
+
+fn valid_phone_number(value: &str) -> bool {
+	let mut rejected: [Option<phonenumber::PhoneNumber>; PHONE_REGIONS.len()] =
+		std::array::from_fn(|_| None);
+	for (index, region) in PHONE_REGIONS.into_iter().enumerate() {
+		let Ok(number) = phonenumber::parse(Some(region), value) else {
+			continue;
+		};
+		// Only complete, equal parsed numbers share a rejection within this candidate.
+		if rejected[..index]
+			.iter()
+			.flatten()
+			.any(|prior| prior == &number)
+		{
+			continue;
+		}
+		if number.is_valid() {
+			return true;
+		}
+		rejected[index] = Some(number);
+	}
+	false
+}
+
 pub struct NativeDetector {
 	rules: Vec<(String, Regex)>,
 	max_bytes: usize,
 	max_findings: usize,
+	timeout: std::time::Duration,
 }
 impl NativeDetector {
 	pub fn new(config: &PiiConfig) -> Result<Self, PiiError> {
@@ -38,18 +72,48 @@ impl NativeDetector {
 			rules,
 			max_bytes: config.max_text_bytes,
 			max_findings: config.max_findings,
+			timeout: std::time::Duration::from_millis(config.timeout_ms),
 		})
 	}
 }
 #[async_trait::async_trait]
 impl PiiDetector for NativeDetector {
+	async fn prepare(&self) -> Result<(), PiiError> {
+		if !self
+			.rules
+			.iter()
+			.any(|(entity, _)| entity == "PHONE_NUMBER")
+		{
+			return Ok(());
+		}
+		tokio::task::spawn_blocking(|| {
+			// Initialize the shared metadata, a valid local sample, and regional rejection paths.
+			// Synthetic values stay local; their validity is not a policy decision.
+			let _ = phonenumber::parse(Some(country::CN), "13800138000").is_ok_and(|n| n.is_valid());
+			for region in PHONE_REGIONS {
+				let _ = phonenumber::parse(Some(region), "1111111111").is_ok_and(|n| n.is_valid());
+			}
+		})
+		.await
+		.map_err(|_| PiiError::Unavailable)
+	}
+
 	async fn detect(&self, text: &str, _language: &str) -> Result<Vec<PiiFinding>, PiiError> {
 		if text.len() > self.max_bytes {
 			return Err(PiiError::InputLimit);
 		}
+		let deadline = tokio::time::Instant::now() + self.timeout;
 		let mut output = Vec::new();
 		for (entity, regex) in &self.rules {
-			for item in regex.find_iter(text) {
+			for (index, item) in regex.find_iter(text).enumerate() {
+				// Bound time spent on rejected candidates too. Individual regex searches and
+				// phone parses are synchronous; cancellation resumes at these checkpoints.
+				if index != 0 && index % 32 == 0 {
+					tokio::task::yield_now().await;
+				}
+				if tokio::time::Instant::now() >= deadline {
+					return Err(PiiError::Timeout);
+				}
 				let value = if entity == "IP_ADDRESS" && item.as_str().parse::<IpAddr>().is_err() {
 					item.as_str().trim_end_matches('.')
 				} else {
@@ -82,20 +146,13 @@ impl PiiDetector for NativeDetector {
 						bounded
 							&& (8..=15).contains(&digits)
 							&& value.parse::<IpAddr>().is_err()
-							&& [
-								country::CN,
-								country::US,
-								country::GB,
-								country::DE,
-								country::IN,
-								country::CA,
-								country::BR,
-							]
-							.into_iter()
-							.any(|region| phonenumber::parse(Some(region), value).is_ok_and(|n| n.is_valid()))
+							&& valid_phone_number(value)
 					},
 					_ => true,
 				};
+				if tokio::time::Instant::now() >= deadline {
+					return Err(PiiError::Timeout);
+				}
 				if !valid {
 					continue;
 				}
@@ -110,7 +167,53 @@ impl PiiDetector for NativeDetector {
 					source: "native".into(),
 				});
 			}
+			if tokio::time::Instant::now() >= deadline {
+				return Err(PiiError::Timeout);
+			}
 		}
 		Ok(output)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn candidate_reuse_matches_independent_regional_validation() {
+		let reference = |value: &str| {
+			PHONE_REGIONS
+				.into_iter()
+				.any(|region| phonenumber::parse(Some(region), value).is_ok_and(|n| n.is_valid()))
+		};
+		for value in [
+			"",
+			"1111111111",
+			"13800138000",
+			"+86 138 0013 8000",
+			"+1 202-555-0123",
+			"+1 647-555-0123",
+			"+44 20 7946 0958",
+			"+49 30 901820",
+			"+91 98765 43210",
+			"+55 11 91234-5678",
+			"+39 02 36618 300",
+			"+1 202-555-0123 ext. 001",
+			"+1 202-555-0123 ext. 002",
+			"020 7946 0958",
+			"0044 20 7946 0958",
+			"192.0.2.1",
+			"not a phone",
+		] {
+			assert_eq!(valid_phone_number(value), reference(value), "{value}");
+		}
+		for digits in 8..=15 {
+			for index in 0..512u64 {
+				let number = 10u64.pow(digits - 1) + index * 104729;
+				for value in [number.to_string(), format!("+{number}")] {
+					assert_eq!(valid_phone_number(&value), reference(&value), "{value}");
+				}
+			}
+		}
 	}
 }

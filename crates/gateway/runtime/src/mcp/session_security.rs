@@ -101,12 +101,24 @@ pub(crate) fn restrict_for_context(
 	ctx: &super::upstream::IncomingRequestContext,
 ) {
 	if let Some(access) = ctx.as_request().extensions().get::<SessionAccess>() {
-		session_capabilities(capabilities, access.binding.is_some());
-		tasks::capabilities(access, capabilities);
+		access.restrict_advertised_capabilities(capabilities);
 	}
 }
 
 impl SessionAccess {
+	fn restrict_advertised_capabilities(&self, capabilities: &mut rmcp::model::ServerCapabilities) {
+		session_capabilities(capabilities, self.binding.is_some());
+		if self
+			.flow
+			.as_ref()
+			.is_some_and(crate::security_flow::FlowAccess::restricts_untrusted_payloads)
+		{
+			capabilities.resources = None;
+			capabilities.prompts = None;
+		}
+		tasks::capabilities(self, capabilities);
+	}
+
 	fn security(&self) -> super::security::McpSecurity<'_> {
 		super::security::McpSecurity::new(Some(&self.config), self.legacy.as_ref())
 	}
@@ -193,18 +205,22 @@ impl SessionAccess {
 			action,
 			binding: None,
 			_stream: slot,
-			flow: crate::security_flow::prepare(config, &parts.headers, &parts.extensions)?,
+			flow: crate::security_flow::prepare_async(config, &parts.headers, &parts.extensions).await?,
 			policies: inputs.policies.clone(),
 			legacy: inputs.security_pipeline.clone(),
 			authorization_request: Arc::new(http::Request::from_parts(parts.clone(), ())),
 		};
-		access.check_async().await?;
+		access.check().await?;
 		Ok(Some(Box::new(access)))
 	}
-	pub(super) fn current(&self) -> Result<(), ProxyError> {
+	pub(super) async fn current(&self) -> Result<(), ProxyError> {
+		self.current_local()?;
 		if let Some(flow) = &self.flow {
-			flow.current()?;
+			flow.current_async().await?;
 		}
+		self.current_local()
+	}
+	pub(crate) fn current_local(&self) -> Result<(), ProxyError> {
 		if self.expires <= chrono::Utc::now().timestamp() {
 			return Err(self.denial("credential-expired"));
 		}
@@ -216,26 +232,20 @@ impl SessionAccess {
 		}
 		Ok(())
 	}
-	pub fn check(&self) -> Result<(), ProxyError> {
-		self.current()?;
-		self
-			.security()
-			.authorize(&self.action, None)
-			.map_err(|_| self.denial("authorization"))?;
-		self.current()
-	}
 
-	pub async fn check_async(&self) -> Result<(), ProxyError> {
-		self.current()?;
-		let security = self.security();
-		Box::pin(super::dispatch::authorize(
-			http_for_authorization(self),
-			&self.action,
-			security.authorize_async(&self.action, None),
-		))
-		.await?
-		.map_err(|_| self.denial("authorization"))?;
-		self.current()
+	pub fn check(&self) -> futures_util::future::BoxFuture<'_, Result<(), ProxyError>> {
+		Box::pin(async move {
+			self.current().await?;
+			let security = self.security();
+			Box::pin(super::dispatch::authorize(
+				http_for_authorization(self),
+				&self.action,
+				security.authorize_async(&self.action, None),
+			))
+			.await?
+			.map_err(|_| self.denial("authorization"))?;
+			self.current().await
+		})
 	}
 
 	fn validate_binding(&self, binding: &SessionBinding) -> Result<(), ProxyError> {
@@ -262,12 +272,12 @@ impl SessionAccess {
 	pub async fn bind(&mut self, binding: Arc<SessionBinding>) -> Result<(), ProxyError> {
 		self.validate_binding(&binding)?;
 		self.binding = Some(binding);
-		self.check_async().await
+		self.check().await
 	}
 
 	/// Call only after an authorized message is accepted. Reauthorization timers are not activity.
-	fn record_activity(&self) -> Result<(), ProxyError> {
-		self.current()?;
+	async fn record_activity(&self) -> Result<(), ProxyError> {
+		self.current().await?;
 		if let Some(binding) = &self.binding {
 			let mut last = binding
 				.last_access
@@ -312,11 +322,49 @@ impl SessionAccess {
 			parts.extensions.insert(flow.clone());
 		}
 	}
+	/// Keep polling the pending operation while periodic authorization waits for storage it may
+	/// itself own. Hold one completed result until authorization finishes; never spawn a reader.
+	async fn checked_wait<'a, T>(
+		&'a self,
+		future: impl Future<Output = T>,
+		end: tokio::time::Instant,
+		check: impl Fn() -> futures_util::future::BoxFuture<'a, Result<(), ProxyError>>,
+	) -> Result<T, ProxyError> {
+		let mut revision = self.revision.clone();
+		tokio::select! {
+			biased;
+			_ = revision.changed() => return Err(self.denial("config-changed")),
+			_ = tokio::time::sleep_until(end) => return Err(self.denial("stream-timeout")),
+			result = check() => result?,
+		}
+		tokio::pin!(future);
+		let interval = Duration::from_secs(self.limits.reauthorize_seconds);
+		let mut next_check = tokio::time::Instant::now() + interval;
+		let mut pending: Option<futures_util::future::BoxFuture<'_, Result<(), ProxyError>>> = None;
+		let mut output = None;
+		loop {
+			tokio::select! {
+				biased;
+				_ = revision.changed() => return Err(self.denial("config-changed")),
+				_ = tokio::time::sleep_until(end) => return Err(self.denial("stream-timeout")),
+				result = async { pending.as_mut().expect("enabled authorization").await }, if pending.is_some() => {
+					result?;
+					pending = None;
+					if let Some(output) = output.take() { return Ok(output); }
+					next_check = tokio::time::Instant::now() + interval;
+				},
+				value = &mut future, if output.is_none() => {
+					output = Some(value);
+					if pending.is_none() { pending = Some(check()); }
+				},
+				_ = tokio::time::sleep_until(next_check), if pending.is_none() => { pending = Some(check()); },
+			}
+		}
+	}
 	pub async fn call(
 		&self,
 		future: impl Future<Output = Result<Response, ProxyError>>,
 	) -> Result<Response, ProxyError> {
-		tokio::pin!(future);
 		let end = tokio::time::Instant::now()
 			+ Duration::from_secs(
 				self
@@ -324,30 +372,18 @@ impl SessionAccess {
 					.stream_idle_seconds
 					.min(self.limits.max_stream_seconds),
 			);
-		self.check_async().await?;
-		let mut revision = self.revision.clone();
-		loop {
-			tokio::select! {
-				biased;
-				_ = revision.changed() => return Err(self.denial("config-changed")),
-				_ = tokio::time::sleep_until(end) => return Err(self.denial("stream-timeout")),
-				_ = tokio::time::sleep(Duration::from_secs(self.limits.reauthorize_seconds)) => self.check_async().await?,
-				result = &mut future => {
-					self.check_async().await?;
-					// A successfully admitted request counts before response-body demand begins.
-					if result.as_ref().is_ok_and(|r| r.status().is_success()) {
-						self.record_activity()?;
-					}
-					return result;
-				},
-			}
+		let result = self.checked_wait(future, end, || self.check()).await?;
+		if result.as_ref().is_ok_and(|r| r.status().is_success()) {
+			self.record_activity().await?;
 		}
+		result
 	}
+
 	pub fn denial(&self, rule: &str) -> ProxyError {
 		deny(&self.action, rule)
 	}
 	pub async fn protect_response(&self, mut response: Response) -> Result<Response, ProxyError> {
-		self.check_async().await?;
+		self.check().await?;
 		response.headers_mut().insert(
 			http::header::CACHE_CONTROL,
 			"private, no-store".parse().expect("constant"),
@@ -361,26 +397,18 @@ impl SessionAccess {
 		let idle = tokio::time::Instant::now() + Duration::from_secs(self.limits.stream_idle_seconds);
 		let stream = futures_util::stream::try_unfold(
 			(access, body.into_data_stream(), idle),
-			move |(mut access, mut body, mut idle)| async move {
-				access.check_async().await?;
-				loop {
-					let bytes = tokio::select! {
-						biased;
-						_ = access.revision.changed() => return Err(access.denial("config-changed")),
-						_ = tokio::time::sleep_until(idle.min(end)) => return Err(access.denial("stream-timeout")),
-						_ = tokio::time::sleep(Duration::from_secs(access.limits.reauthorize_seconds)) => { access.check_async().await?; continue; },
-						bytes = body.next() => bytes,
-					};
-					access.check_async().await?;
-					return match bytes {
-						None => Ok(None),
-						Some(Err(_)) => Err(access.denial("response-stream")),
-						Some(Ok(bytes)) => {
-							idle = tokio::time::Instant::now()
-								+ Duration::from_secs(access.limits.stream_idle_seconds);
-							Ok(Some((bytes, (access, body, idle))))
-						},
-					};
+			move |(access, mut body, mut idle)| async move {
+				let bytes = access
+					.checked_wait(body.next(), idle.min(end), || access.check())
+					.await?;
+				match bytes {
+					None => Ok(None),
+					Some(Err(_)) => Err(access.denial("response-stream")),
+					Some(Ok(bytes)) => {
+						idle =
+							tokio::time::Instant::now() + Duration::from_secs(access.limits.stream_idle_seconds);
+						Ok(Some((bytes, (access, body, idle))))
+					},
 				}
 			},
 		);
@@ -422,7 +450,7 @@ impl SessionAccess {
 		{
 			return Err(self.denial("initialize-response"));
 		}
-		self.check_async().await?;
+		self.check().await?;
 		if let Some(capabilities) = rpc[0]["result"]["capabilities"].as_object_mut() {
 			for name in ["experimental", "extensions", "logging", "completions"] {
 				capabilities.remove(name);
@@ -472,7 +500,7 @@ pub(crate) fn deny(action: &ActionRequest, rule: &str) -> ProxyError {
 }
 
 /// Only responses to this POST's RPC may be disclosed. No implicit subscriptions/reverse RPC.
-pub(crate) fn protect_messages(
+pub(crate) async fn protect_messages(
 	stream: Messages,
 	context: &super::upstream::IncomingRequestContext,
 	request: Option<&rmcp::model::JsonRpcRequest<rmcp::model::ClientRequest>>,
@@ -486,8 +514,9 @@ pub(crate) fn protect_messages(
 		#[cfg(feature = "gateway-llm")]
 		None,
 	)
+	.await
 }
-pub(crate) fn protect_messages_with_sampling(
+pub(crate) async fn protect_messages_with_sampling(
 	stream: Messages,
 	context: &super::upstream::IncomingRequestContext,
 	request: Option<&rmcp::model::JsonRpcRequest<rmcp::model::ClientRequest>>,
@@ -524,7 +553,7 @@ pub(crate) fn protect_messages_with_sampling(
 		}
 	});
 	let parent = if let Some(task) = &task {
-		reverse::task_parent(&access, &server, request, task)
+		reverse::task_parent(&access, &server, request, task).await
 	} else {
 		reverse::parent(&access, &server, request, business.clone())
 	};
@@ -544,36 +573,36 @@ pub(crate) fn protect_messages_with_sampling(
 				if done {
 					return Ok(None);
 				}
-				access.check_async().await.map_err(ClientError::new)?;
+				access.check().await.map_err(ClientError::new)?;
 				if let Some(task) = &task {
-					task.check(&access).map_err(ClientError::new)?;
+					task.check(&access).await.map_err(ClientError::new)?;
 				}
 				reverse::check_parent(&access, parent.as_ref()).map_err(ClientError::new)?;
-				let mut revision = access.revision.clone();
 				let deadline =
 					tokio::time::Instant::now() + Duration::from_secs(access.limits.stream_idle_seconds);
 				loop {
 					let mut message = loop {
-						let message = loop {
-							tokio::select! {
-								biased;
-								_ = revision.changed() => return Err(ClientError::new(access.denial("config-changed"))),
-								_ = tokio::time::sleep_until(deadline) => return Err(ClientError::new(access.denial("stream-timeout"))),
-								_ = tokio::time::sleep(Duration::from_secs(access.limits.reauthorize_seconds)) => {
-									access.check_async().await.map_err(ClientError::new)?;
-									if let Some(task) = &task { task.check(&access).map_err(ClientError::new)?; }
-									reverse::check_parent(&access, parent.as_ref()).map_err(ClientError::new)?;
-								},
-								message = stream.next() => break message,
-							}
-						};
+						let message = access
+							.checked_wait(stream.next(), deadline, || {
+								Box::pin(async {
+									access.check().await?;
+									if let Some(task) = &task {
+										task.check(&access).await?;
+									}
+									reverse::check_parent(&access, parent.as_ref())
+								})
+							})
+							.await
+							.map_err(ClientError::new)?;
 						let Some(message) = message else {
 							return Ok(None);
 						};
 						let mut message = message?;
 						#[cfg(feature = "gateway-llm")]
 						if task.is_some() && reverse::sampling::is_request(&message) {
-							reverse::request(&access, parent.as_ref(), &mut message).map_err(ClientError::new)?;
+							reverse::request(&access, parent.as_ref(), &mut message)
+								.await
+								.map_err(ClientError::new)?;
 							Box::pin(reverse::sampling::execute(
 								&access,
 								parent.as_ref(),
@@ -582,14 +611,14 @@ pub(crate) fn protect_messages_with_sampling(
 							))
 							.await
 							.map_err(ClientError::new)?;
-							access.record_activity().map_err(ClientError::new)?;
+							access.record_activity().await.map_err(ClientError::new)?;
 							continue;
 						}
 						break message;
 					};
-					access.check_async().await.map_err(ClientError::new)?;
+					access.check().await.map_err(ClientError::new)?;
 					if let Some(task) = &task {
-						task.check(&access).map_err(ClientError::new)?;
+						task.check(&access).await.map_err(ClientError::new)?;
 					}
 					reverse::check_parent(&access, parent.as_ref()).map_err(ClientError::new)?;
 					if let Some(business) = &business {
@@ -612,12 +641,13 @@ pub(crate) fn protect_messages_with_sampling(
 								};
 							if action.action.action_type != security_types::ActionType::ToolList {
 								flow
-									.check(&action, &destination)
+									.check_async(&action, &destination)
+									.await
 									.map_err(ClientError::new)?;
 							}
 						}
 					}
-					access.current().map_err(ClientError::new)?;
+					access.current().await.map_err(ClientError::new)?;
 					reverse::check_parent(&access, parent.as_ref()).map_err(ClientError::new)?;
 					use rmcp::model::ServerJsonRpcMessage;
 					if security_audit::StateJournal::encoded_len(&message, access.limits.max_message_bytes)
@@ -627,7 +657,9 @@ pub(crate) fn protect_messages_with_sampling(
 					}
 					let valid = match &mut message {
 						ServerJsonRpcMessage::Request(_) => {
-							reverse::request(&access, parent.as_ref(), &mut message).map_err(ClientError::new)?;
+							reverse::request(&access, parent.as_ref(), &mut message)
+								.await
+								.map_err(ClientError::new)?;
 							true
 						},
 						ServerJsonRpcMessage::Response(r) => {
@@ -637,6 +669,7 @@ pub(crate) fn protect_messages_with_sampling(
 								}
 								task
 									.response(&access, &mut r.result)
+									.await
 									.map_err(ClientError::new)?;
 								if security_audit::StateJournal::encoded_len(
 									&message,
@@ -646,21 +679,27 @@ pub(crate) fn protect_messages_with_sampling(
 								{
 									return Err(ClientError::new(access.denial("task-message-limit")));
 								}
-								access.record_activity().map_err(ClientError::new)?;
+								access.record_activity().await.map_err(ClientError::new)?;
 								return Ok(Some((message, (stream, access, true, Ok(parent)))));
 							}
 							use rmcp::model::ServerResult::*;
 							if let (Some(flow), ListToolsResult(list)) = (&access.flow, &mut r.result) {
-								list.tools.retain(|tool| {
+								let mut visible = Vec::with_capacity(list.tools.len());
+								for tool in std::mem::take(&mut list.tools) {
 									let action = security_pipeline::tool_invoke_for_identity(
 										access.action.request_id.clone(),
 										access.identity.clone(),
 										tool.name.to_string(),
 									);
-									flow
-										.check(&action, &format!("{server}/{}", tool.name))
+									if flow
+										.check_async(&action, &format!("{server}/{}", tool.name))
+										.await
 										.is_ok()
-								});
+									{
+										visible.push(tool);
+									}
+								}
+								list.tools = visible;
 							}
 							let kind_matches = matches!(
 								(method.as_deref(), &r.result),
@@ -682,15 +721,18 @@ pub(crate) fn protect_messages_with_sampling(
 									)
 							);
 							if let rmcp::model::ServerResult::InitializeResult(init) = &mut r.result {
-								tasks::observe_initialize(&access, &server, init).map_err(ClientError::new)?;
-								session_capabilities(&mut init.capabilities, access.binding.is_some());
-								tasks::capabilities(&access, &mut init.capabilities);
+								tasks::observe_initialize(&access, &server, init)
+									.await
+									.map_err(ClientError::new)?;
+								access.restrict_advertised_capabilities(&mut init.capabilities);
 							}
 							if let rmcp::model::ServerResult::DiscoverResult(discovery) = &mut r.result {
 								session_capabilities(&mut discovery.capabilities, false);
 							}
 							if let rmcp::model::ServerResult::ListToolsResult(list) = &mut r.result {
-								tasks::observe_tools(&access, &server, list).map_err(ClientError::new)?;
+								tasks::observe_tools(&access, &server, list)
+									.await
+									.map_err(ClientError::new)?;
 							}
 							kind_matches && expected.as_ref() == Some(&r.id)
 						},
@@ -715,6 +757,7 @@ pub(crate) fn protect_messages_with_sampling(
 									if expected.is_none() =>
 								{
 									subscriptions::notification(&access, &server, &message)
+										.await
 										.map_err(ClientError::new)?
 								},
 								// Logging, unrelated progress, and upstream Task identifiers are not grants.
@@ -746,13 +789,13 @@ pub(crate) fn protect_messages_with_sampling(
 					if matches!(message, ServerJsonRpcMessage::Response(_))
 						&& let Some(ticket) = &subscription
 					{
-						ticket.commit(&access)?;
+						ticket.commit(&access).await?;
 					}
 					let done = matches!(
 						message,
 						ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
 					) && expected.is_some();
-					access.record_activity().map_err(ClientError::new)?;
+					access.record_activity().await.map_err(ClientError::new)?;
 					return Ok(Some((message, (stream, access, done, Ok(parent)))));
 				}
 			}

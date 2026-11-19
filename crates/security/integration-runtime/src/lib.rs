@@ -22,7 +22,9 @@ pub mod pii;
 mod prepared;
 #[cfg(feature = "rag-sqlite")]
 pub mod rag_sqlite;
+pub mod rag_storage;
 mod remote_worker;
+pub use remote_worker::with_blocking_io;
 pub mod required_audit;
 pub mod task_cleanup;
 pub use data_egress::{DataEgressConfig, check_data_egress};
@@ -243,6 +245,7 @@ impl SecurityConfig {
 		{
 			return Err("MCP Task interactions require executionBudget.maxConcurrent >= 2 for the result stream and response".into());
 		}
+
 		if let Some(audit) = &self.required_audit {
 			if self.mode != SecurityMode::Enforce {
 				return Err("requiredAudit requires enforce mode".into());
@@ -428,6 +431,9 @@ fn runtime_decision(request: &ActionRequest, result: Result<(), GatewayError>) -
 }
 
 impl AuditSink for TracingAuditSink {
+	fn is_blocking(&self) -> bool {
+		false
+	}
 	fn record(&self, event: SecurityEvent) {
 		tracing::info!(
 			target: "security_audit",
@@ -586,8 +592,8 @@ fn has_remote_evaluation(config: &SecurityConfig) -> bool {
 		|| config.approval.is_some()
 }
 
-/// Await remote evaluation without blocking the caller's Tokio worker. The owned snapshot and
-/// audit destination outlive cancellation of the waiter; running HTTP work retains its admission
+/// Await blocking evaluation/persistence without blocking the caller's Tokio worker. The owned snapshot and
+/// audit destination outlive cancellation of the waiter; running work retains its admission
 /// slot until it actually ends. An Allow still requires the caller's final lifecycle checks.
 pub async fn evaluate_with_audit_async(
 	config: Arc<SecurityConfig>,
@@ -613,7 +619,7 @@ async fn evaluate_decision_async(
 			audit.as_ref(),
 		));
 	}
-	if !has_remote_evaluation(&config) {
+	if !has_remote_evaluation(&config) && !audit.is_blocking() {
 		return evaluate_with_audit_inner(&config, &action, arguments.as_ref(), audit.as_ref());
 	}
 	let mode = config.mode;

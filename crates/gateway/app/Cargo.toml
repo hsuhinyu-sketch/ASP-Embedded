@@ -61,6 +61,7 @@ gateway-mcp = ["ai-security-platform-runtime/gateway-mcp"]
 inference-routing = ["ai-security-platform-runtime/inference-routing", "gateway-llm"]
 security-s1 = ["ai-security-platform-runtime/security-s1"]
 security-a2a-sqlite = ["ai-security-platform-runtime/security-a2a-sqlite"]
+security-rag-sqlite = ["ai-security-platform-runtime/security-rag-sqlite", "dep:security-integration-runtime", "dep:serde_yaml"]
 gateway-rag = ["ai-security-platform-runtime/gateway-rag"]
 security-pii = ["ai-security-platform-runtime/security-pii"]
 security-pii-presidio = ["ai-security-platform-runtime/security-pii-presidio"]
@@ -87,6 +88,10 @@ telemetry-otlp = ["ai-security-platform-runtime/telemetry-otlp"]
 schema = ["ai-security-platform-runtime/schema"]
 
 [dependencies]
+security-integration-runtime = { path = "../../security/integration-runtime", features = ["rag-sqlite"], optional = true }
+security-audit = { path = "../../security/audit" }
+serde_json.workspace = true
+serde_yaml = { workspace = true, optional = true }
 pprof-alloc.workspace = true
 platform-core.workspace = true
 ai-security-platform-runtime = { path = "../runtime", default-features = false }

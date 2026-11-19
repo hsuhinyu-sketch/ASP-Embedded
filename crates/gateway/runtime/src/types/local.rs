@@ -85,7 +85,9 @@ impl NormalizedLocalConfig {
 		let document = crate::config::parse_document(s)?;
 		config.startup_config.ensure_unchanged(&document)?;
 		let local_config: LocalConfig = serde_json::from_value(document)?;
-		convert(resources, gateway_name, config, local_config).await
+		// Conversion embeds every enabled protocol's preparation state. Keep this large
+		// future out of callers' futures and stacks (startup, reload and validation).
+		Box::pin(convert(resources, gateway_name, config, local_config)).await
 	}
 }
 
@@ -385,7 +387,10 @@ pub struct LocalAiSystemConfig {
 	pub name: Strng,
 	/// Common security controls applied to every enabled gateway in this AI system.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+	#[cfg_attr(
+		feature = "schema",
+		schemars(schema_with = "ai_system_security_schema")
+	)]
 	security: Option<security_integration_runtime::SecurityConfig>,
 	/// inference contains system-wide LLM controls. It is compiled into the selected LLM
 	/// gateway's existing parameter, rate-limit, and routing policies.
@@ -421,8 +426,42 @@ pub struct LocalAiSystemConfig {
 	/// stays in this AI system's `security` block; RAG-specific source, context, and backend values
 	/// are validated here and used when the RAG router is mounted by the host application.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+	#[cfg_attr(feature = "schema", schemars(schema_with = "ai_system_rag_schema"))]
 	rag: Option<LocalRagGatewayConfig>,
+}
+
+#[cfg(feature = "schema")]
+fn ai_system_rag_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+	schemars::json_schema!({
+		"properties": {
+			"contextGuard": {
+				"properties": {
+					"ruleSet": {
+						"description": "Built-in rules used when indirectInstructionPatterns is omitted.",
+						"enum": ["legacy", "contextual"],
+						"default": "legacy"
+					}
+				}
+			}
+		}
+	})
+}
+
+#[cfg(feature = "schema")]
+fn ai_system_security_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+	schemars::json_schema!({
+		"properties": {
+			"crossComponent": {
+				"properties": {
+					"restrictUntrustedPayloads": {
+						"description": "Apply Restricted egress policy to request payloads in a dedicated RAG and direct OpenAI-compatible model gateway.",
+						"type": "boolean",
+						"default": false
+					}
+				}
+			}
+		}
+	})
 }
 
 impl LocalConfig {
@@ -497,6 +536,14 @@ impl RagSystemConfig {
 			bail!("aiSystems['{name}'].rag requires authentication.mode: strict");
 		}
 		rag.gateway.validate().map_err(anyhow::Error::msg)?;
+		if security
+			.cross_component
+			.as_ref()
+			.is_some_and(|flow| flow.sqlite.is_some())
+			&& (rag.gateway.lifecycle.is_some() || rag.gateway.qdrant.integrity.is_none())
+		{
+			bail!("joint SQLite RAG state excludes rag.lifecycle and requires qdrant.integrity");
+		}
 		Ok(Self {
 			name,
 			gateway: rag.gateway,
@@ -2019,6 +2066,7 @@ async fn convert(
 ) -> anyhow::Result<NormalizedLocalConfig> {
 	validate_gateway_capabilities(&i)?;
 	validate_local_listener_ports(&i)?;
+	let restricted_payloads = i.validate_restricted_payloads(config)?;
 	let LocalConfig {
 		config: _,
 		mut frontend_policies,
@@ -2074,12 +2122,7 @@ async fn convert(
 			all_backends.extend_from_slice(&backends);
 			ls.insert(l)
 		}
-		let sockaddr = if cfg!(target_family = "unix") && config.ipv6_enabled {
-			SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), bind_port)
-		} else {
-			// Windows and IPv6 don't mix well apparently?
-			SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bind_port)
-		};
+		let sockaddr = listener_address(config, bind_port);
 		let b = Bind {
 			key: bind_name,
 			address: sockaddr,
@@ -2209,6 +2252,7 @@ async fn convert(
 				Ok::<_, anyhow::Error>(Arc::new(security))
 			})
 			.transpose()?;
+
 		#[cfg(feature = "gateway-rag")]
 		if let Some(rag) = rag {
 			rag_systems.push(RagSystemConfig::new(
@@ -2307,6 +2351,7 @@ async fn convert(
 		workloads,
 		services,
 	};
+	normalized.validate_restricted_payload_scope(restricted_payloads)?;
 	normalized
 		.prepare_security(config.dependency_egress.as_ref())
 		.await?;
@@ -2593,6 +2638,17 @@ fn validate_local_listener_ports(config: &LocalConfig) -> anyhow::Result<()> {
 	Ok(())
 }
 
+fn listener_address(config: &crate::Config, port: u16) -> SocketAddr {
+	let address = config.bind_address.unwrap_or_else(|| {
+		if cfg!(target_family = "unix") && config.ipv6_enabled {
+			IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+		} else {
+			IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+		}
+	});
+	SocketAddr::new(address, port)
+}
+
 async fn convert_mcp_config(
 	resources: &crate::resource_manager::ResourceFetcher,
 	config: &crate::Config,
@@ -2658,11 +2714,7 @@ async fn convert_mcp_config(
 	let mut listener_set = ListenerSet::default();
 	listener_set.insert(listener);
 
-	let sockaddr = if cfg!(target_family = "unix") && config.ipv6_enabled {
-		SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
-	} else {
-		SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
-	};
+	let sockaddr = listener_address(config, port);
 
 	let bind = Bind {
 		key: strng::format!("bind/{}", port),
@@ -2727,11 +2779,7 @@ async fn convert_a2a_config(
 		convert_listener(resources, config, 0, listener, bind_key.clone(), gateway).await?;
 	let mut listeners = ListenerSet::default();
 	listeners.insert(listener);
-	let address = if cfg!(target_family = "unix") && config.ipv6_enabled {
-		SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
-	} else {
-		SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
-	};
+	let address = listener_address(config, port);
 	Ok((
 		Bind {
 			key: bind_key,

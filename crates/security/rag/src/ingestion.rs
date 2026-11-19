@@ -497,7 +497,7 @@ where
 	pub fn new(
 		backend: B,
 		pipeline: SecurityPipeline<A, S>,
-		config: IngestionGuardConfig,
+		mut config: IngestionGuardConfig,
 		audit: IS,
 	) -> Result<Self, IngestionError> {
 		if config.max_document_bytes == 0 {
@@ -550,6 +550,16 @@ where
 			return Err(IngestionError::InvalidConfig(
 				"classificationRules ids must be unique".into(),
 			));
+		}
+		// These private, immutable patterns use the same Unicode normalization as content.
+		for rule in &mut config.label_rules {
+			rule.pattern = rule.pattern.to_lowercase();
+		}
+		for rule in &mut config.classification_rules {
+			rule.pattern = rule.pattern.to_lowercase();
+		}
+		for pattern in &mut config.quarantine_patterns {
+			*pattern = pattern.to_lowercase();
 		}
 		Ok(Self {
 			backend,
@@ -664,9 +674,11 @@ where
 			);
 		}
 
-		let labels = self.classify_labels(&request.content);
-		let (classification, classification_source) = self.classify(&request.content);
-		let findings = self.quarantine_findings(&request.content);
+		let normalized = request.content.to_lowercase();
+		let labels = self.classify_labels(&normalized);
+		let (classification, classification_source) = self.classify(&normalized);
+		let findings = self.quarantine_findings(&normalized);
+		drop(normalized);
 		let document = IndexedDocument {
 			corpus_id: request.corpus_id.clone(),
 			document_id: request.document_id.clone(),
@@ -749,23 +761,21 @@ where
 		}
 	}
 
-	fn classify_labels(&self, content: &str) -> Vec<String> {
-		let normalized = content.to_lowercase();
+	fn classify_labels(&self, normalized: &str) -> Vec<String> {
 		self
 			.config
 			.label_rules
 			.iter()
-			.filter(|rule| normalized.contains(&rule.pattern.to_lowercase()))
+			.filter(|rule| normalized.contains(&rule.pattern))
 			.map(|rule| rule.label.clone())
 			.collect()
 	}
 
-	fn classify(&self, content: &str) -> (DataClassification, String) {
-		let normalized = content.to_lowercase();
+	fn classify(&self, normalized: &str) -> (DataClassification, String) {
 		let mut classification = self.config.default_classification;
 		let mut source = "default-classification".to_string();
 		for rule in &self.config.classification_rules {
-			if rule.classification > classification && normalized.contains(&rule.pattern.to_lowercase()) {
+			if rule.classification > classification && normalized.contains(&rule.pattern) {
 				classification = rule.classification;
 				source = format!("rule:{}", rule.id);
 			}
@@ -773,14 +783,13 @@ where
 		(classification, source)
 	}
 
-	fn quarantine_findings(&self, content: &str) -> Vec<IngestionFinding> {
-		let normalized = content.to_lowercase();
+	fn quarantine_findings(&self, normalized: &str) -> Vec<IngestionFinding> {
 		self
 			.config
 			.quarantine_patterns
 			.iter()
 			.enumerate()
-			.filter(|(_, pattern)| normalized.contains(&pattern.to_lowercase()))
+			.filter(|(_, pattern)| normalized.contains(pattern.as_str()))
 			.map(|(index, _)| IngestionFinding {
 				kind: IngestionFindingKind::QuarantinePattern,
 				rule_id: format!("quarantine-pattern-{index}"),

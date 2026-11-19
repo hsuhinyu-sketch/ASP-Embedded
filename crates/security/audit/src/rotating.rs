@@ -2,7 +2,50 @@
 //! Exhaustion preserves unexpired evidence and denies admission rather than overwriting it.
 use crate::{StateJournal, StateJournalConfig};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::VecDeque, fs::File, io, path::PathBuf};
+use std::{
+	collections::VecDeque,
+	fs::File,
+	io,
+	path::{Path, PathBuf},
+};
+
+const CONTROL_MAX_BYTES: u64 = 67_108_864;
+
+#[derive(Debug)]
+struct CapacityExceeded;
+impl std::fmt::Display for CapacityExceeded {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("audit capacity exhausted; unexpired evidence retained")
+	}
+}
+impl std::error::Error for CapacityExceeded {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AuditCapacityState {
+	Ready,
+	High,
+	Exhausted,
+	Failed,
+}
+
+/// Last validated writer state. This is operational metadata, never an execution grant.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditJournalStatus {
+	pub state: AuditCapacityState,
+	pub used_bytes: u64,
+	pub maximum_bytes: u64,
+	/// Current segment plus unused segment slots; closed-segment slack is not writable.
+	pub writable_bytes: u64,
+	pub segments: usize,
+	pub maximum_segments: usize,
+	pub control_bytes: u64,
+	pub retention_seconds: u64,
+	pub next_sequence: u64,
+	pub last_commit_millis: i64,
+	pub next_reclaim_at_millis: Option<i64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -72,10 +115,18 @@ pub struct RotatingAuditJournal<T> {
 	next_sequence: u64,
 	highwater: i64,
 	healthy: bool,
+	capacity_blocked: bool,
 	marker: std::marker::PhantomData<T>,
 }
 impl<T: Serialize + DeserializeOwned> RotatingAuditJournal<T> {
-	pub fn open(mut config: AuditJournalConfig, capacity: usize) -> io::Result<(Self, VecDeque<T>)> {
+	pub fn open(config: AuditJournalConfig, capacity: usize) -> io::Result<(Self, VecDeque<T>)> {
+		Self::open_inner(config, capacity, true)
+	}
+	fn open_inner(
+		mut config: AuditJournalConfig,
+		capacity: usize,
+		create: bool,
+	) -> io::Result<(Self, VecDeque<T>)> {
 		config.validate().map_err(io::Error::other)?;
 		// Persist and use the resolved private directory for both IO and retention deletion.
 		// Later changes to a caller's symlink alias must never retarget cleanup.
@@ -85,11 +136,11 @@ impl<T: Serialize + DeserializeOwned> RotatingAuditJournal<T> {
 		}
 		let spec = StateJournalConfig {
 			path: config.directory.join("writer.jsonl"),
-			max_bytes: 67_108_864,
+			max_bytes: CONTROL_MAX_BYTES,
 		};
 		let mut configured = false;
 		let mut head = 0;
-		let mut control = StateJournal::open::<Control>(&spec, |record| {
+		let replay_control = |record| {
 			match record {
 				Control::Configuration {
 					version: 1,
@@ -99,7 +150,12 @@ impl<T: Serialize + DeserializeOwned> RotatingAuditJournal<T> {
 				_ => return Err(io::Error::other("invalid audit control journal")),
 			}
 			Ok(())
-		})?;
+		};
+		let mut control = if create {
+			StateJournal::open::<Control>(&spec, replay_control)?
+		} else {
+			StateJournal::open_existing::<Control>(&spec, replay_control)?
+		};
 		if control.is_fresh() {
 			control.append(&Control::Configuration {
 				version: 1,
@@ -143,34 +199,37 @@ impl<T: Serialize + DeserializeOwned> RotatingAuditJournal<T> {
 		for (start, path) in paths {
 			let mut first = true;
 			let mut last_millis = 0;
-			let journal = StateJournal::open::<Entry<T>>(
-				&StateJournalConfig {
-					path: path.clone(),
-					max_bytes: config.max_segment_bytes,
-				},
-				|entry| {
-					if entry.version != 1
-						|| entry.millis < highwater
-						|| entry.millis > now
-						|| first && entry.sequence != start
-						|| previous.is_some_and(|p: u64| p.checked_add(1) != Some(entry.sequence))
-						|| StateJournal::encoded_len(&entry, 16383).is_err()
-					{
-						return Err(io::Error::other("invalid audit sequence/clock/record"));
+			let spec = StateJournalConfig {
+				path: path.clone(),
+				max_bytes: config.max_segment_bytes,
+			};
+			let replay_entry = |entry: Entry<T>| {
+				if entry.version != 1
+					|| entry.millis < highwater
+					|| entry.millis > now
+					|| first && entry.sequence != start
+					|| previous.is_some_and(|p: u64| p.checked_add(1) != Some(entry.sequence))
+					|| StateJournal::encoded_len(&entry, 16383).is_err()
+				{
+					return Err(io::Error::other("invalid audit sequence/clock/record"));
+				}
+				first = false;
+				previous = Some(entry.sequence);
+				highwater = entry.millis;
+				last_millis = entry.millis;
+				if entry.millis >= cutoff {
+					if output.len() == capacity {
+						output.pop_front();
 					}
-					first = false;
-					previous = Some(entry.sequence);
-					highwater = entry.millis;
-					last_millis = entry.millis;
-					if entry.millis >= cutoff {
-						if output.len() == capacity {
-							output.pop_front();
-						}
-						output.push_back(entry.event);
-					}
-					Ok(())
-				},
-			)?;
+					output.push_back(entry.event);
+				}
+				Ok(())
+			};
+			let journal = if create {
+				StateJournal::open::<Entry<T>>(&spec, replay_entry)?
+			} else {
+				StateJournal::open_existing::<Entry<T>>(&spec, replay_entry)?
+			};
 			if first {
 				return Err(io::Error::other("empty audit segment"));
 			}
@@ -192,9 +251,12 @@ impl<T: Serialize + DeserializeOwned> RotatingAuditJournal<T> {
 			next_sequence,
 			highwater,
 			healthy: true,
+			capacity_blocked: false,
 			marker: Default::default(),
 		};
-		journal.prune(now)?;
+		if create {
+			journal.prune(now)?;
+		}
 		Ok((journal, output))
 	}
 	fn check(&mut self) -> io::Result<i64> {
@@ -216,6 +278,7 @@ impl<T: Serialize + DeserializeOwned> RotatingAuditJournal<T> {
 				.is_some_and(|s| s.last_millis < cutoff)
 		{
 			let old = self.segments.pop_front().expect("checked");
+			self.capacity_blocked = false;
 			let path = old.path.clone();
 			drop(old);
 			if std::fs::remove_file(&path)
@@ -230,8 +293,15 @@ impl<T: Serialize + DeserializeOwned> RotatingAuditJournal<T> {
 	}
 	pub fn append(&mut self, event: &T) -> io::Result<()> {
 		let result = self.append_inner(event);
-		if result.is_err() {
-			self.healthy = false;
+		match &result {
+			Err(error) if error.get_ref().is_some_and(|e| e.is::<CapacityExceeded>()) => {
+				// No write was attempted. Future requests may reclaim expired closed segments.
+				self.capacity_blocked = true;
+			},
+			Err(_) => self.healthy = false,
+			// A smaller record may fit, but does not resolve the capacity warning.
+			// Only reclamation clears this episode; every actual append is still checked.
+			Ok(()) => {},
 		}
 		result
 	}
@@ -252,9 +322,7 @@ impl<T: Serialize + DeserializeOwned> RotatingAuditJournal<T> {
 			.is_none_or(|s| s.journal.remaining_bytes() < bytes)
 		{
 			if self.segments.len() >= self.config.max_segments {
-				return Err(io::Error::other(
-					"audit capacity exhausted; unexpired evidence retained",
-				));
+				return Err(io::Error::other(CapacityExceeded));
 			}
 			let path = self
 				.config
@@ -331,4 +399,124 @@ impl<T: Serialize + DeserializeOwned> RotatingAuditJournal<T> {
 	pub fn next_sequence(&self) -> u64 {
 		self.next_sequence
 	}
+	/// Bounded metadata only: no directory scan, replay, pruning or storage mutation.
+	pub fn status(&self) -> AuditJournalStatus {
+		let maximum_bytes = self.config.max_segment_bytes * self.config.max_segments as u64;
+		let writable_bytes = self
+			.segments
+			.back()
+			.map_or(0, |s| s.journal.remaining_bytes())
+			+ (self.config.max_segments - self.segments.len()) as u64 * self.config.max_segment_bytes;
+		let state = if !self.healthy {
+			AuditCapacityState::Failed
+		} else if self.capacity_blocked {
+			AuditCapacityState::Exhausted
+		} else if writable_bytes <= maximum_bytes / 5 {
+			AuditCapacityState::High
+		} else {
+			AuditCapacityState::Ready
+		};
+		AuditJournalStatus {
+			state,
+			used_bytes: self
+				.segments
+				.iter()
+				.map(|s| self.config.max_segment_bytes - s.journal.remaining_bytes())
+				.sum(),
+			maximum_bytes,
+			writable_bytes,
+			segments: self.segments.len(),
+			maximum_segments: self.config.max_segments,
+			control_bytes: CONTROL_MAX_BYTES - self.control.remaining_bytes(),
+			retention_seconds: self.config.retention_seconds,
+			next_sequence: self.next_sequence,
+			last_commit_millis: self.highwater,
+			next_reclaim_at_millis: (self.segments.len() > 1).then(|| {
+				self
+					.segments
+					.front()
+					.expect("nonempty")
+					.last_millis
+					.saturating_add(self.config.retention_seconds as i64 * 1000)
+					.saturating_add(1)
+			}),
+		}
+	}
+
+	/// Offline byte-for-byte export. The normal exclusive writer locks exclude a live Gateway.
+	/// Export never prunes or acknowledges removal; the manifest is written only after all copies.
+	pub fn export(config: AuditJournalConfig, destination: &Path) -> io::Result<AuditExportReport> {
+		let (mut journal, _) = Self::open_inner(config, 1, false)?;
+		if !destination.is_absolute() || destination.file_name().is_none() {
+			return Err(io::Error::other(
+				"audit export requires a new absolute output directory",
+			));
+		}
+		let destination = destination
+			.parent()
+			.expect("absolute path")
+			.canonicalize()?
+			.join(destination.file_name().expect("checked"));
+		if destination.starts_with(&journal.config.directory) {
+			return Err(io::Error::other(
+				"audit export must be outside the source directory",
+			));
+		}
+		let mut builder = std::fs::DirBuilder::new();
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::DirBuilderExt;
+			builder.mode(0o700);
+		}
+		builder.create(&destination)?;
+		let mut files = Vec::new();
+		files.push(AuditExportFile {
+			name: "writer.jsonl".into(),
+			bytes: journal.control.copy_to(&destination.join("writer.jsonl"))?,
+		});
+		for segment in &mut journal.segments {
+			let name = format!("segment-{:020}.jsonl", segment.start);
+			let bytes = segment.journal.copy_to(&destination.join(&name))?;
+			files.push(AuditExportFile { name, bytes });
+		}
+		journal.check()?;
+		let report = AuditExportReport {
+			version: 1,
+			source: journal.config.directory.clone(),
+			last_sequence: journal.next_sequence - 1,
+			files,
+		};
+		let mut options = std::fs::OpenOptions::new();
+		options.create_new(true).write(true);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::OpenOptionsExt;
+			options.mode(0o600);
+		}
+		let mut manifest = options.open(destination.join("manifest.json"))?;
+		serde_json::to_writer_pretty(&mut manifest, &report).map_err(io::Error::other)?;
+		manifest.sync_all()?;
+		File::open(&destination)?.sync_all()?;
+		File::open(destination.parent().expect("resolved parent"))?.sync_all()?;
+		Ok(report)
+	}
 }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditExportReport {
+	pub version: u32,
+	pub source: PathBuf,
+	pub last_sequence: u64,
+	pub files: Vec<AuditExportFile>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuditExportFile {
+	pub name: String,
+	pub bytes: u64,
+}
+
+#[cfg(test)]
+#[path = "rotating_tests.rs"]
+mod tests;

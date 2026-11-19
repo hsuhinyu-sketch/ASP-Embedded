@@ -52,6 +52,7 @@ async fn s6_config_revocation_discards_guard_window_and_cancels_pending_evaluati
 	);
 	let mut body = guards
 		.protect_response(Response::new(Body::new(guarded)), &target)
+		.await
 		.unwrap()
 		.into_body();
 	assert!(futures_util::poll!(body.frame()).is_pending());
@@ -72,6 +73,7 @@ async fn s6_config_revocation_blocks_already_approved_guard_flush_queue() {
 		gateway_llm::GuardedSseBody::with_threshold(Body::from(data), vec![], 4096, None::<()>, 1);
 	let mut body = guards
 		.protect_response(Response::new(Body::new(guarded)), &target)
+		.await
 		.unwrap()
 		.into_body();
 	let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
@@ -117,6 +119,10 @@ async fn pending_reauthorization_withholds_frames_and_rechecks_revocation_before
 		});
 		let (release, wait) = tokio::sync::oneshot::channel();
 		let mut body = Box::pin(ResponseBody {
+			frame: None,
+			checked: false,
+			reauthorizing: true,
+			authorize_idle: true,
 			body: Some(Body::from_stream(source)),
 			guards,
 			target,
@@ -160,6 +166,10 @@ async fn denied_or_dropped_pending_reauthorization_releases_upstream_without_pol
 		});
 		let (release, wait) = tokio::sync::oneshot::channel();
 		let mut body = Box::pin(ResponseBody {
+			frame: None,
+			checked: false,
+			reauthorizing: true,
+			authorize_idle: true,
 			body: Some(Body::from_stream(source)),
 			guards,
 			target,
@@ -307,6 +317,7 @@ async fn revoked_rag_context_blocks_already_buffered_model_output() {
 		crate::security_flow::prepare(&config, request.headers(), request.extensions()).unwrap();
 	let mut body = guards
 		.protect_response(Response::new(Body::from("buffered knowledge")), &target)
+		.await
 		.unwrap()
 		.into_body();
 	issuer.revoke(&id).unwrap();
@@ -319,6 +330,7 @@ async fn adapted_buffer_cannot_disclose_after_configuration_invalidation() {
 	let (guards, revision, target) = guarded();
 	let mut body = guards
 		.protect_response(Response::new(Body::from("buffered secret")), &target)
+		.await
 		.unwrap()
 		.into_body();
 	revision.invalidate();
@@ -339,6 +351,7 @@ async fn idle_model_stream_rechecks_and_drops_upstream_on_invalidation() {
 		});
 	let mut body = guards
 		.protect_response(Response::new(Body::from_stream(stream)), &target)
+		.await
 		.unwrap()
 		.into_body();
 	let invalidate = async {
@@ -362,6 +375,7 @@ async fn response_guard_preserves_trailers_and_consumer_drop_releases_source() {
 	let source = Body::new(http_body_util::StreamBody::new(frames));
 	let mut body = guards
 		.protect_response(Response::new(source), &target)
+		.await
 		.unwrap()
 		.into_body();
 	assert_eq!(
@@ -389,6 +403,7 @@ async fn response_guard_preserves_trailers_and_consumer_drop_releases_source() {
 		});
 	let response = guards
 		.protect_response(Response::new(Body::from_stream(stream)), &target)
+		.await
 		.unwrap();
 	drop(response);
 	assert!(dropped.load(Ordering::Acquire));
@@ -403,6 +418,7 @@ async fn invalidation_while_polling_source_cannot_disclose_the_returned_frame() 
 	});
 	let mut body = guards
 		.protect_response(Response::new(Body::from_stream(source)), &target)
+		.await
 		.unwrap()
 		.into_body();
 	assert!(body.frame().await.unwrap().is_err());
@@ -444,4 +460,175 @@ async fn candidate_filtering_is_silent_and_final_denial_names_the_evaluated_acti
 		.find(|e| e.policy_id.as_deref() == Some("routing:dispatch:attempt:2"))
 		.unwrap();
 	assert!(dispatch.action.starts_with("ModelInvoke:"));
+}
+
+struct AsyncContext {
+	transaction: tokio::sync::Mutex<()>,
+	delay: bool,
+	produced: AtomicBool,
+	entered: AtomicBool,
+	denied: AtomicBool,
+	release: tokio::sync::Notify,
+	wait_dropped: Arc<AtomicBool>,
+}
+impl security_integration_runtime::context_store::SecurityContextStore for AsyncContext {
+	fn issue(
+		&self,
+		_: security_integration_runtime::context_store::ContextBinding,
+		_: u64,
+		_: usize,
+		_: security_types::DataClassification,
+	) -> Result<String, security_integration_runtime::context_store::ContextError> {
+		unreachable!("only async classification is used by this fixture")
+	}
+	fn classification(
+		&self,
+		_: &str,
+		_: &security_integration_runtime::context_store::ContextBinding,
+	) -> Result<
+		security_types::DataClassification,
+		security_integration_runtime::context_store::ContextError,
+	> {
+		panic!("async response checking must not call the synchronous store")
+	}
+	fn elevate(
+		&self,
+		_: &str,
+		_: &security_integration_runtime::context_store::ContextBinding,
+		_: security_types::DataClassification,
+	) -> Result<(), security_integration_runtime::context_store::ContextError> {
+		unreachable!()
+	}
+	fn revoke(
+		&self,
+		_: &str,
+		_: &security_integration_runtime::context_store::ContextBinding,
+	) -> Result<(), security_integration_runtime::context_store::ContextError> {
+		unreachable!()
+	}
+	fn classification_async(
+		self: Arc<Self>,
+		_: String,
+		_: security_integration_runtime::context_store::ContextBinding,
+	) -> security_integration_runtime::context_store::ContextFuture<security_types::DataClassification>
+	{
+		Box::pin(async move {
+			let _transaction = self.transaction.lock().await;
+			if self.delay {
+				tokio::task::yield_now().await;
+			}
+			if self.produced.load(Ordering::SeqCst) {
+				let _drop = OnDrop(self.wait_dropped.clone());
+				self.entered.store(true, Ordering::SeqCst);
+				self.release.notified().await;
+			}
+			if self.denied.load(Ordering::SeqCst) {
+				Err(security_integration_runtime::context_store::ContextError::Denied)
+			} else {
+				Ok(security_types::DataClassification::Restricted)
+			}
+		})
+	}
+}
+
+#[tokio::test]
+async fn post_frame_async_commit_withholds_data_and_handles_denial_invalidation_and_drop() {
+	use futures_util::StreamExt;
+	use security_integration_runtime::context_store::ContextStoreSlot;
+	for mode in ["allow", "deny", "invalidate", "drop", "nested"] {
+		let store = Arc::new(AsyncContext {
+			transaction: Default::default(),
+			delay: mode == "nested",
+			produced: AtomicBool::new(false),
+			entered: AtomicBool::new(false),
+			denied: AtomicBool::new(false),
+			release: Default::default(),
+			wait_dropped: Arc::new(AtomicBool::new(false)),
+		});
+		let (mut guards, revision, target) = guarded();
+		let mut config: SecurityConfig = serde_json::from_value(serde_json::json!({"mode":"enforce",
+			"policies":[{"id":"allow","enabled":true,"effect":"allow"}],
+			"crossComponent":{"namespace":"async-frame-test", "destinations":[{"classification":"public"},{"classification":"internal"},{"classification":"restricted"}]}})).unwrap();
+		config.cross_component.as_mut().unwrap().store = ContextStoreSlot::new(store.clone());
+		let claims = crate::http::jwt::Claims {
+			inner: serde_json::from_value(serde_json::json!({"iss":"https://issuer.example", "sub":"alice", "tenantId":"tenant-a", "exp":chrono::Utc::now().timestamp()+300})).unwrap(), jwt: "verified-extension".into() };
+		let mut headers = ::http::HeaderMap::new();
+		headers.insert(
+			crate::security_flow::HEADER,
+			uuid::Uuid::new_v4().to_string().parse().unwrap(),
+		);
+		let mut extensions = ::http::Extensions::new();
+		extensions.insert(claims);
+		let guard = Arc::get_mut(&mut guards.0[0]).unwrap();
+		guard.flow = crate::security_flow::prepare_async(&config, &headers, &extensions)
+			.await
+			.unwrap();
+		guard.config = Arc::new(config);
+		let source_dropped = Arc::new(AtomicBool::new(false));
+		let source_lease = OnDrop(source_dropped.clone());
+		let observed = store.clone();
+		let source = futures_util::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+			b"protected-frame",
+		))])
+		.map(move |frame| {
+			let _lease = &source_lease;
+			observed.produced.store(mode != "nested", Ordering::SeqCst);
+			frame
+		});
+		let mut body = guards
+			.protect_response(Response::new(Body::from_stream(source)), &target)
+			.await
+			.unwrap()
+			.into_body();
+		if mode == "nested" {
+			let mut body = guards
+				.protect_response(Response::new(body), &target)
+				.await
+				.unwrap()
+				.into_body();
+			let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+				.await
+				.expect("nested guards must make progress")
+				.unwrap()
+				.unwrap();
+			assert_eq!(frame.into_data().unwrap(), "protected-frame");
+			assert!(
+				tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+					.await
+					.unwrap()
+					.is_none()
+			);
+			assert!(source_dropped.load(Ordering::SeqCst));
+			continue;
+		}
+		assert!(
+			futures_util::poll!(body.frame()).is_pending(),
+			"{mode}: no frame before durable confirmation"
+		);
+		assert!(store.entered.load(Ordering::SeqCst));
+		match mode {
+			"drop" => {
+				drop(body);
+			},
+			"invalidate" => {
+				revision.invalidate();
+				assert!(body.frame().await.unwrap().is_err());
+				assert!(body.frame().await.is_none());
+			},
+			_ => {
+				store.denied.store(mode == "deny", Ordering::SeqCst);
+				store.produced.store(false, Ordering::SeqCst);
+				store.release.notify_one();
+				let result = body.frame().await.unwrap();
+				if mode == "allow" {
+					assert_eq!(result.unwrap().into_data().unwrap(), "protected-frame");
+				} else {
+					assert!(result.is_err());
+				}
+				assert!(body.frame().await.is_none());
+			},
+		}
+		assert!(store.wait_dropped.load(Ordering::SeqCst));
+		assert!(source_dropped.load(Ordering::SeqCst));
+	}
 }

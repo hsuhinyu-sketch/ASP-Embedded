@@ -1,0 +1,66 @@
+# Cargo features: gateway-mcp,security-s1,tls-aws-lc
+# Setup and port map: docs/README.md#安全网关场景-profile
+config:
+  bindAddress: 127.0.0.1
+  management:
+    mode: edge
+  securityAudit:
+    directory: ${AISP_EXAMPLE_STATE_DIR}/tool-gateway/audit
+aiSystems:
+  - name: tool-gateway
+    security:
+      mode: enforce
+      requiredIdentity:
+        user: true
+        tenant: true
+        agent: false
+      requiredAudit:
+        actionTypes:
+          - toolInvoke
+      policies:
+        - id: use-tool-session
+          tenantId: tenant-a
+          actionType: mcpSessionOperation
+          effect: allow
+          enabled: true
+        - id: list-tools
+          tenantId: tenant-a
+          actionType: toolList
+          effect: allow
+          enabled: true
+        - id: ping-tool-server
+          tenantId: tenant-a
+          actionType: mcpOperation
+          effect: allow
+          enabled: true
+          actionName: ping
+          resourceType: mcpServer
+          resourceId: local
+        - id: invoke-echo
+          tenantId: tenant-a
+          actionType: toolInvoke
+          effect: allow
+          enabled: true
+          resourceId: echo
+      mcpSessions:
+        maxSessions: 64
+        maxStreams: 32
+      dataEgress:
+        classification: internal
+        toolDestinations:
+          - local/echo
+    mcp:
+      port: 14102
+      statefulMode: stateful
+      policies:
+        jwtAuth:
+          mode: strict
+          issuer: ${AISP_EXAMPLE_ISSUER}
+          audiences:
+            - tool-gateway
+          jwks:
+            file: ${AISP_EXAMPLE_JWKS_FILE}
+      targets:
+        - name: local
+          mcp:
+            host: http://127.0.0.1:18200/mcp

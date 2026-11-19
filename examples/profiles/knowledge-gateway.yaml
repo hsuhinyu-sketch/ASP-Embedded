@@ -1,0 +1,73 @@
+# Cargo features: gateway-rag,security-s1,tls-aws-lc
+# Setup and port map: docs/README.md#安全网关场景-profile
+config:
+  bindAddress: 127.0.0.1
+  management:
+    mode: edge
+  securityAudit:
+    directory: ${AISP_EXAMPLE_STATE_DIR}/knowledge-gateway/audit
+aiSystems:
+  - name: knowledge-gateway
+    security:
+      mode: enforce
+      requiredIdentity:
+        user: true
+        tenant: true
+        agent: false
+      requiredAudit:
+        actionTypes:
+          - knowledgeIngest
+          - knowledgeRetrieve
+      policies:
+        - id: ingest-documents
+          tenantId: tenant-a
+          actionType: knowledgeIngest
+          effect: allow
+          enabled: true
+          userId: operator-a
+        - id: retrieve-knowledge
+          tenantId: tenant-a
+          actionType: knowledgeRetrieve
+          effect: allow
+          enabled: true
+        - id: assemble-context
+          tenantId: tenant-a
+          actionType: contextAssemble
+          effect: allow
+          enabled: true
+      dependencyEgress:
+        requireTls: false
+        destinations:
+          embedding:
+            - 127.0.0.1:18001
+          qdrant:
+            - 127.0.0.1:6333
+    rag:
+      port: 14103
+      authentication:
+        mode: strict
+        issuer: ${AISP_EXAMPLE_ISSUER}
+        audiences:
+          - knowledge-gateway
+        jwks:
+          file: ${AISP_EXAMPLE_JWKS_FILE}
+      qdrant:
+        endpoint: http://127.0.0.1:6333
+        collection: knowledge-gateway
+        quarantineCollection: knowledge-gateway-quarantine
+        defaultChunkAccess:
+          allowTenantAuthenticated: true
+        integrity:
+          keyId: knowledge-gateway
+          keyEnvVar: AISP_EXAMPLE_VECTOR_KEY
+      embedding:
+        endpoint: http://127.0.0.1:18001/v1/embeddings
+        model: local-embedding
+      lifecycle:
+        namespace: knowledge-gateway
+        storage:
+          path: ${AISP_EXAMPLE_STATE_DIR}/knowledge-gateway/documents.jsonl
+          maxBytes: 16777216
+      contextGuard:
+        mode: enforce
+        ruleSet: contextual
