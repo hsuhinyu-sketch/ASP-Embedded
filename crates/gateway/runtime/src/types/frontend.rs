@@ -1,34 +1,14 @@
 use std::time::Duration;
 
 use frozen_collections::{FzHashSet, Len};
-use serde::{Deserialize, Serialize};
 
 use crate::telemetry::log::OrderedStringMap;
 use crate::{apply, defaults, *};
 
+pub use super::listener_tls::TLSVersion;
+
 fn empty_string_set(set: &Arc<FzHashSet<String>>) -> bool {
 	set.is_empty()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[allow(non_camel_case_types)]
-pub enum TLSVersion {
-	TLS_V1_0,
-	TLS_V1_1,
-	TLS_V1_2,
-	TLS_V1_3,
-}
-
-impl From<TLSVersion> for super::agent::TLSVersion {
-	fn from(value: TLSVersion) -> Self {
-		match value {
-			TLSVersion::TLS_V1_0 => super::agent::TLSVersion::TLS_V1_0,
-			TLSVersion::TLS_V1_1 => super::agent::TLSVersion::TLS_V1_1,
-			TLSVersion::TLS_V1_2 => super::agent::TLSVersion::TLS_V1_2,
-			TLSVersion::TLS_V1_3 => super::agent::TLSVersion::TLS_V1_3,
-		}
-	}
 }
 
 #[apply(schema_enum!)]

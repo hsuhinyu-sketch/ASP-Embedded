@@ -13,6 +13,23 @@ pub use rotating::{
 	RotatingAuditJournal,
 };
 
+/// Acquires a nonblocking exclusive lock held for the lifetime of the file handle.
+pub fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+	#[cfg(target_os = "android")]
+	{
+		use std::os::fd::AsRawFd;
+
+		// Rust 1.96 does not expose File locking on Android. The borrowed file keeps the fd valid.
+		// SAFETY: flock receives a valid fd and only changes its advisory lock.
+		if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+			return Err(std::io::Error::last_os_error());
+		}
+		Ok(())
+	}
+	#[cfg(not(target_os = "android"))]
+	file.try_lock().map_err(std::io::Error::other)
+}
+
 pub fn event_from_decision(
 	event_id: impl Into<String>,
 	request: &ActionRequest,

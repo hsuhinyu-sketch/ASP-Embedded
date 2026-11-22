@@ -173,7 +173,7 @@ impl StateJournal {
 			},
 			Err(error) => return Err(error),
 		};
-		file.try_lock().map_err(io::Error::other)?;
+		crate::try_lock_exclusive(&file)?;
 		let length = file.metadata()?.len();
 		let mut journal = Self {
 			file,

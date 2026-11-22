@@ -240,9 +240,7 @@ impl DurableExecutionBudgetStore {
 			return Ok(existing);
 		}
 		let (mut file, fresh) = open_file(&canonical)?;
-		file
-			.try_lock()
-			.map_err(|_| "execution journal already locked")?;
+		security_audit::try_lock_exclusive(&file).map_err(|_| "execution journal already locked")?;
 		if !same_file(&file, &canonical) {
 			return Err("execution journal file identity/permissions invalid".into());
 		}

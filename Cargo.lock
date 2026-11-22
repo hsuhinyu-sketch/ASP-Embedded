@@ -6121,6 +6121,7 @@ name = "security-audit"
 version = "0.0.0"
 dependencies = [
  "chrono",
+ "libc",
  "security-types",
  "serde",
  "serde_json",

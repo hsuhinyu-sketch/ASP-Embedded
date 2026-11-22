@@ -26,7 +26,7 @@ impl JsonlJournal {
 			options.mode(0o600);
 		}
 		let file = options.open(path)?;
-		file.try_lock().map_err(io::Error::other)?;
+		crate::try_lock_exclusive(&file)?;
 		let mut retained = VecDeque::new();
 		let mut reader = BufReader::new(&file);
 		let mut line = String::new();

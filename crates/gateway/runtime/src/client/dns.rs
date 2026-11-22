@@ -6,9 +6,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use arc_swap::ArcSwapOption;
+#[cfg(not(target_os = "android"))]
 use hickory_resolver::TokioResolver;
+#[cfg(target_os = "android")]
+use hickory_resolver::config::LookupIpStrategy;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::net::NetError;
+#[cfg(not(target_os = "android"))]
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 
 use crate::*;
@@ -127,32 +130,68 @@ impl CacheEntry {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum Resolver {
+	#[cfg(not(target_os = "android"))]
 	Real(TokioResolver),
+	#[cfg(target_os = "android")]
+	System(LookupIpStrategy),
 }
 
 impl Resolver {
-	async fn resolve(&self, host: &str) -> Result<(Box<[IpAddr]>, Instant), NetError> {
+	async fn resolve(&self, host: &str) -> anyhow::Result<(Box<[IpAddr]>, Instant)> {
 		match self {
-			Resolver::Real(resolver) => resolver.lookup_ip(host).await.map(|lookup| {
-				let expiry = lookup.valid_until();
-				let ips = lookup.iter().collect::<Box<_>>();
-				(ips, expiry)
-			}),
+			#[cfg(not(target_os = "android"))]
+			Resolver::Real(resolver) => {
+				let lookup = resolver.lookup_ip(host).await?;
+				Ok((lookup.iter().collect(), lookup.valid_until()))
+			},
+			#[cfg(target_os = "android")]
+			Resolver::System(strategy) => {
+				let mut ips: Vec<IpAddr> = tokio::net::lookup_host((host, 0))
+					.await?
+					.map(|address| address.ip())
+					.collect();
+				match strategy {
+					LookupIpStrategy::Ipv4Only => ips.retain(IpAddr::is_ipv4),
+					LookupIpStrategy::Ipv6Only => ips.retain(IpAddr::is_ipv6),
+					LookupIpStrategy::Ipv4thenIpv6 if ips.iter().any(IpAddr::is_ipv4) => {
+						ips.retain(IpAddr::is_ipv4);
+					},
+					LookupIpStrategy::Ipv6thenIpv4 if ips.iter().any(IpAddr::is_ipv6) => {
+						ips.retain(IpAddr::is_ipv6);
+					},
+					_ => {},
+				}
+				anyhow::ensure!(
+					!ips.is_empty(),
+					"system DNS returned no addresses for {host}"
+				);
+				// The system resolver does not return a TTL. Use the existing minimum refresh interval.
+				Ok((ips.into_boxed_slice(), Instant::now()))
+			},
 		}
 	}
 }
 
 impl CachedResolver {
-	pub fn new(config: ResolverConfig, mut opts: ResolverOpts) -> Self {
-		// always consult the system's /etc/hosts file when resolving hostnames
-		opts.use_hosts_file = hickory_resolver::config::ResolveHosts::Always;
-		let mut rb =
-			hickory_resolver::Resolver::builder_with_config(config, TokioRuntimeProvider::default());
-		*rb.options_mut() = opts;
-		let dns_resolver = rb.build().expect("dns resolver config should be valid");
+	pub fn new(config: ResolverConfig, opts: ResolverOpts) -> Self {
+		#[cfg(not(target_os = "android"))]
+		let resolver = {
+			let mut opts = opts;
+			// always consult the system's /etc/hosts file when resolving hostnames
+			opts.use_hosts_file = hickory_resolver::config::ResolveHosts::Always;
+			let mut rb =
+				hickory_resolver::Resolver::builder_with_config(config, TokioRuntimeProvider::default());
+			*rb.options_mut() = opts;
+			Resolver::Real(rb.build().expect("dns resolver config should be valid"))
+		};
+		#[cfg(target_os = "android")]
+		let resolver = {
+			let _ = config;
+			Resolver::System(opts.ip_strategy)
+		};
 		CachedResolver {
 			entries: Arc::new(Mutex::new(HashMap::new())),
-			dns: Arc::new(Resolver::Real(dns_resolver)),
+			dns: Arc::new(resolver),
 		}
 	}
 

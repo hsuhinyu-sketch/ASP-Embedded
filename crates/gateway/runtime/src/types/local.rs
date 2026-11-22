@@ -14,12 +14,11 @@ pub type LocalInferenceConfig = serde_json::Value;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ::http::Uri;
-use anyhow::{Context, Error, anyhow, bail};
+use anyhow::{Error, anyhow, bail};
 use macro_rules_attribute::apply;
 use platform_core::prelude::Strng;
 use secrecy::SecretString;
@@ -27,9 +26,9 @@ use secrecy::SecretString;
 #[cfg(feature = "providers-aws")]
 use crate::agentcore;
 use crate::http::auth::BackendAuth;
-use crate::http::backendtls::{LocalBackendTLS, ResolvedBackendTLS};
+use crate::http::backendtls::LocalBackendTLS;
 use crate::http::transformation_cel::{LocalTransformationConfig, Transformation};
-use crate::http::{filters, health, retry, timeout, transformation_cel};
+use crate::http::{filters, health, retry, timeout};
 use crate::mcp::{FailureMode, McpAuthorization};
 use crate::store::{LocalWorkload, RequestPolicy};
 use crate::types::agent::{
@@ -38,14 +37,22 @@ use crate::types::agent::{
 	ListenerKey, ListenerName, ListenerProtocol, ListenerSet, ListenerTarget, LocalMcpAuthentication,
 	McpAuthentication, McpBackend, McpTarget, McpTargetName, McpTargetSpec, OpenAPITarget, PathMatch,
 	PolicyPhase, PolicyTarget, PolicyType, ResourceName, Route, RouteBackendReference,
-	RouteBackendTarget, RouteGroupKey, RouteMatch, RouteName, ServerTLSConfig, SimpleBackend,
-	SimpleBackendReference, SimpleBackendWithPolicies, SseTargetSpec, StreamableHTTPTargetSpec,
-	TCPRoute, TCPRouteBackendReference, Target, TargetedPolicy, TracingConfig, TrafficPolicy,
-	TunnelProtocol, TypedResourceName, validate_mcp_target_name,
+	RouteBackendTarget, RouteGroupKey, RouteMatch, RouteName, SimpleBackend, SimpleBackendReference,
+	SimpleBackendWithPolicies, SseTargetSpec, StreamableHTTPTargetSpec, TCPRoute,
+	TCPRouteBackendReference, Target, TargetedPolicy, TracingConfig, TrafficPolicy, TunnelProtocol,
+	TypedResourceName, validate_mcp_target_name,
 };
 use crate::types::discovery::{NamespacedHostname, Service};
 use crate::types::{backend, frontend};
 use crate::*;
+
+use super::routing::default_weight;
+use migration::merge_deprecated_frontend_policies;
+
+pub use super::listener_tls::{LocalTLSServerConfig, LocalTLSServerMode};
+pub use migration::migrate_deprecated_local_config;
+
+mod migration;
 
 type LocalExtAuthzPolicy = LocalExplicitOrConditional<crate::http::ext_authz::ExtAuthz>;
 type LocalDirectResponsePolicy = LocalExplicitOrConditional<filters::DirectResponse>;
@@ -89,210 +96,6 @@ impl NormalizedLocalConfig {
 		// future out of callers' futures and stacks (startup, reload and validation).
 		Box::pin(convert(resources, gateway_name, config, local_config)).await
 	}
-}
-
-pub fn migrate_deprecated_local_config(s: &str) -> anyhow::Result<String> {
-	let cfg: serde_json::Value = serdes::yamlviajson::from_str(s)?;
-	let cfg = migrate_deprecated_frontend_policies(cfg)?;
-	serdes::yamlviajson::to_string(&cfg)
-}
-
-fn migrate_deprecated_frontend_policies(
-	mut cfg: serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
-	let Some(root) = cfg.as_object_mut() else {
-		return Ok(cfg);
-	};
-
-	let Some(config) = root.get("config").and_then(serde_json::Value::as_object) else {
-		return Ok(cfg);
-	};
-
-	let deprecated_logging = config.get("logging").cloned();
-	let deprecated_tracing = config.get("tracing").cloned();
-	if deprecated_logging.is_none() && deprecated_tracing.is_none() {
-		return Ok(cfg);
-	}
-
-	let mut deprecated_config = serde_json::Map::new();
-	if let Some(logging) = deprecated_logging {
-		deprecated_config.insert("logging".to_string(), logging);
-	}
-	if let Some(tracing) = deprecated_tracing {
-		deprecated_config.insert("tracing".to_string(), tracing);
-	}
-	let mut deprecated_root = serde_json::Map::new();
-	deprecated_root.insert(
-		"config".to_string(),
-		serde_json::Value::Object(deprecated_config),
-	);
-	let deprecated_cfg_yaml =
-		serdes::yamlviajson::to_string(&serde_json::Value::Object(deprecated_root))?;
-	let deprecated_cfg = crate::config::parse_config(deprecated_cfg_yaml, None)?;
-
-	let mut frontend_policies: LocalFrontendPolicies = serde_json::from_value(
-		root
-			.get("frontendPolicies")
-			.cloned()
-			.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
-	)?;
-	merge_deprecated_frontend_policies(&deprecated_cfg, &mut frontend_policies)?;
-
-	let has_deprecated_log = has_deprecated_frontend_log_fields(&deprecated_cfg.logging);
-	let has_deprecated_tracing = deprecated_cfg.tracing.is_some();
-
-	let frontend_policies_map = root
-		.entry("frontendPolicies")
-		.or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-	let Some(frontend_policies_map) = frontend_policies_map.as_object_mut() else {
-		anyhow::bail!("frontendPolicies must be an object");
-	};
-	if has_deprecated_log {
-		let Some(access_log) = frontend_policies.access_log else {
-			anyhow::bail!("internal error: migrated accessLog was not generated");
-		};
-		frontend_policies_map.insert("accessLog".to_string(), serde_json::to_value(access_log)?);
-		frontend_policies_map.remove("logging");
-	}
-	if has_deprecated_tracing && let Some(tracing) = frontend_policies.tracing {
-		frontend_policies_map.insert("tracing".to_string(), serde_json::to_value(tracing)?);
-	}
-
-	let Some(config) = root
-		.get_mut("config")
-		.and_then(serde_json::Value::as_object_mut)
-	else {
-		return Ok(cfg);
-	};
-	if has_deprecated_log {
-		match config.get_mut("logging") {
-			Some(serde_json::Value::Object(logging)) => {
-				logging.remove("filter");
-				logging.remove("fields");
-				if logging.is_empty() {
-					config.remove("logging");
-				}
-			},
-			Some(_) => {
-				config.remove("logging");
-			},
-			None => {},
-		}
-	}
-	if has_deprecated_tracing {
-		config.remove("tracing");
-	}
-	Ok(cfg)
-}
-
-fn has_deprecated_frontend_log_fields(log: &crate::telemetry::log::Config) -> bool {
-	!log.fields.add.is_empty() || !log.fields.remove.is_empty() || log.filter.is_some()
-}
-
-fn merge_deprecated_frontend_policies(
-	deprecated: &crate::Config,
-	frontend_policies: &mut LocalFrontendPolicies,
-) -> anyhow::Result<()> {
-	let log = &deprecated.logging;
-	let has_deprecated_log = has_deprecated_frontend_log_fields(log);
-	if has_deprecated_log {
-		if frontend_policies.access_log.is_some() {
-			anyhow::bail!(
-				"cannot use deprecated config.logging together with frontendPolicies.accessLog"
-			);
-		}
-		frontend_policies.access_log = Some(frontend::LoggingPolicy {
-			filter: log.filter.clone(),
-			add: log.fields.add.clone(),
-			remove: log.fields.remove.clone(),
-			otlp: None,
-			database: None,
-			access_log_policy: None,
-		});
-	}
-	if let Some(tracing) = deprecated.tracing.clone() {
-		if frontend_policies.tracing.is_some() {
-			anyhow::bail!("cannot use deprecated config.tracing together with frontendPolicies.tracing");
-		}
-		let trc::DeprecatedConfig {
-			endpoint,
-			headers,
-			protocol,
-			fields,
-			random_sampling,
-			client_sampling,
-			path,
-		} = tracing;
-
-		let mut policies = if !headers.is_empty() {
-			let backend_xfm = transformation_cel::LocalTransformationConfig {
-				request: Some(transformation_cel::LocalTransform {
-					set: headers
-						.into_iter()
-						.map(|(k, v)| (strng::new(k), strng::new(v)))
-						.collect(),
-					..Default::default()
-				}),
-				response: None,
-			};
-			let backend_xfm = Transformation::try_from_local_config(backend_xfm, true)?;
-			vec![BackendTrafficPolicy::Transformation(Arc::new(backend_xfm))]
-		} else {
-			Vec::new()
-		};
-		if let Some(ep) = endpoint {
-			let (backend, use_tls) = parse_deprecated_tracing_endpoint(&ep)
-				.with_context(|| format!("failed parsing tracing endpoint: {}", ep))?;
-			if use_tls {
-				policies.push(BackendTrafficPolicy::BackendTLS(
-					ResolvedBackendTLS::default().try_into()?,
-				));
-			}
-			frontend_policies.tracing = Some(TracingConfig {
-				provider_backend: SimpleBackendReference::InlineBackend(backend),
-				policies,
-				attributes: Arc::unwrap_or_clone(fields.add),
-				resources: Default::default(), // Not supported in the old config
-				filter: None,                  // Not supported in the old config
-				remove: Arc::unwrap_or_clone(fields.remove).into_iter().collect(),
-				random_sampling,
-				client_sampling,
-				path,
-				protocol: match protocol {
-					Protocol::Grpc => crate::types::agent::TracingProtocol::Grpc,
-					Protocol::Http => crate::types::agent::TracingProtocol::Http,
-				},
-			});
-		}
-	}
-	Ok(())
-}
-
-fn parse_deprecated_tracing_endpoint(endpoint: &str) -> anyhow::Result<(Target, bool)> {
-	if !endpoint.contains("://") {
-		return Ok((Target::try_from(endpoint)?, false));
-	}
-
-	let uri = Uri::try_from(endpoint)?;
-	let Some(scheme) = uri.scheme_str() else {
-		return Ok((Target::try_from(endpoint)?, false));
-	};
-	if !matches!(scheme, "http" | "https" | "grpc") {
-		anyhow::bail!("unsupported tracing endpoint scheme: {scheme}");
-	}
-	let host = uri
-		.host()
-		.with_context(|| format!("tracing endpoint {endpoint} must include a host"))?;
-	let port = uri.port_u16().or_else(|| match scheme {
-		"http" => Some(80),
-		"https" => Some(443),
-		"grpc" => Some(4317),
-		_ => unreachable!("unsupported tracing endpoint scheme checked above"),
-	});
-	let Some(port) = port else {
-		anyhow::bail!("unsupported tracing endpoint scheme: {scheme}");
-	};
-	Ok((Target::from((host, port)), scheme == "https"))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -790,50 +593,6 @@ enum LocalListenerProtocol {
 	HBONE,
 }
 
-#[derive(Default)]
-#[apply(schema_de!)]
-pub struct LocalTLSServerConfig {
-	/// Certificate source mode. Static mode uses cert/key as the leaf certificate; dynamic CA
-	/// mode uses cert/key as a CA for on-demand SNI leaf certificate issuance.
-	#[serde(default)]
-	pub mode: LocalTLSServerMode,
-	pub cert: PathBuf,
-	pub key: PathBuf,
-	pub root: Option<PathBuf>,
-	/// Optional cipher suite allowlist (order is preserved).
-	#[cfg_attr(feature = "schema", schemars(with = "Option<Vec<String>>"))]
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub cipher_suites: Option<Vec<crate::transport::tls::CipherSuite>>,
-	/// Minimum supported TLS version (only TLS 1.2 and 1.3 are supported).
-	#[serde(
-		default,
-		skip_serializing_if = "Option::is_none",
-		rename = "minTLSVersion",
-		alias = "minTlsVersion"
-	)]
-	pub min_tls_version: Option<frontend::TLSVersion>,
-	/// Maximum supported TLS version (only TLS 1.2 and 1.3 are supported).
-	#[serde(
-		default,
-		skip_serializing_if = "Option::is_none",
-		rename = "maxTLSVersion",
-		alias = "maxTlsVersion"
-	)]
-	pub max_tls_version: Option<frontend::TLSVersion>,
-	/// Key exchange groups allowed for negotiating TLS.
-	#[cfg_attr(feature = "schema", schemars(with = "Option<Vec<String>>"))]
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub key_exchange_groups: Option<Vec<crate::transport::tls::KeyExchangeGroup>>,
-}
-
-#[apply(schema_enum!)]
-#[derive(Default)]
-pub enum LocalTLSServerMode {
-	#[default]
-	Static,
-	DynamicCa,
-}
-
 #[apply(schema_de!)]
 pub struct LocalRouteName {
 	#[serde(default)]
@@ -873,10 +632,6 @@ pub struct LocalRouteBackend {
 	pub backend: LocalBackend,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub policies: Option<LocalBackendPolicies>,
-}
-
-fn default_weight() -> usize {
-	1
 }
 
 #[apply(schema_de!)]
@@ -3445,60 +3200,6 @@ fn mcp_to_simple_backend_and_ref(
 	let bref = SimpleBackendReference::Backend(name.to_string().into());
 	let backend = SimpleLocalBackend::Opaque(b).as_backend(name);
 	(bref, backend)
-}
-
-impl LocalTLSServerConfig {
-	async fn into_server_tls_config_with_resources(
-		self,
-		dynamic_ca_cert_cache: crate::DynamicCaCertCacheConfig,
-		resources: &crate::resource_manager::ResourceFetcher,
-	) -> anyhow::Result<ServerTLSConfig> {
-		let cert_pem = resources
-			.fetch(crate::resource_manager::ResourceRef::File(self.cert))
-			.await?
-			.to_vec();
-		let key_pem = resources
-			.fetch(crate::resource_manager::ResourceRef::File(self.key))
-			.await?
-			.to_vec();
-		let root_pem = match self.root {
-			Some(root) => Some(
-				resources
-					.fetch(crate::resource_manager::ResourceRef::File(root))
-					.await?
-					.to_vec(),
-			),
-			None => None,
-		};
-		match self.mode {
-			LocalTLSServerMode::Static => ServerTLSConfig::from_pem_with_profile(
-				cert_pem,
-				key_pem,
-				root_pem,
-				vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-				self.min_tls_version.map(Into::into),
-				self.max_tls_version.map(Into::into),
-				self.cipher_suites,
-				self.key_exchange_groups,
-				false,
-			),
-			LocalTLSServerMode::DynamicCa => {
-				if root_pem.is_some() {
-					anyhow::bail!("tls.root is not supported with tls.mode=dynamicCa")
-				}
-				super::dynamic_ca_cert::build_dynamic_ca_tls_config_with_profile(
-					cert_pem,
-					key_pem,
-					vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-					self.min_tls_version.map(Into::into),
-					self.max_tls_version.map(Into::into),
-					self.cipher_suites,
-					self.key_exchange_groups,
-					dynamic_ca_cert_cache,
-				)
-			},
-		}
-	}
 }
 
 pub fn local_name(name: Strng) -> ResourceName {

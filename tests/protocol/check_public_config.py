@@ -69,6 +69,12 @@ def main():
         (directory / 'src/observation.rs').write_text('''
 pub fn observation(_: runtime::cel::LLMContext, _: llm::LLMResponse,
                    _: llm::catalog::Catalog, _: llm::provider::PromptCachingConfig) {}
+
+pub fn shared_types(version: runtime::types::frontend::TLSVersion,
+                    family: runtime::types::discovery::IpFamily)
+    -> (runtime::types::agent::TLSVersion, runtime::types::agent::IpFamily) {
+    (version, family)
+}
 ''')
         (directory / 'src/lib.rs').write_text('''
 mod observation;

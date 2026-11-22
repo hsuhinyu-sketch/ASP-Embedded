@@ -107,6 +107,7 @@ pub fn parse_config(
 	.or(dns.lookup_family)
 	.unwrap_or_default();
 	let dns_edns0: Option<bool> = parse("DNS_EDNS0")?.or(dns.edns0);
+	#[cfg(not(target_os = "android"))]
 	let (resolver_cfg, resolver_opts) = {
 		let (cfg, opts) = hickory_resolver::system_conf::read_system_conf().unwrap_or_else(|e| {
 			warn!(err=?e, "failed to read system DNS config, using defaults");
@@ -116,6 +117,16 @@ pub fn parse_config(
 			)
 		});
 		resolve_dns_config(cfg, opts, dns_lookup_family, ipv6_enabled, dns_edns0)
+	};
+	#[cfg(target_os = "android")]
+	let (resolver_cfg, resolver_opts) = {
+		// The CLI runs without a Java application context. Bionic handles DNS.
+		if dns_edns0.is_some() {
+			warn!("the Android system resolver manages EDNS0");
+		}
+		let mut opts = hickory_resolver::config::ResolverOpts::default();
+		opts.ip_strategy = dns_lookup_family.to_lookup_strategy(ipv6_enabled);
+		(hickory_resolver::config::ResolverConfig::default(), opts)
 	};
 	let cluster: String = parse("CLUSTER_ID")?
 		.or(raw.cluster_id.clone())
@@ -818,6 +829,7 @@ fn normalize_tracing_endpoint(
 /// `DnsLookupFamily` as the IP lookup strategy. When `edns0` is `Some`, it
 /// overrides the resolver's EDNS0 setting; when `None`, the system-provided
 /// (or default) value is preserved.
+#[cfg(not(target_os = "android"))]
 fn resolve_dns_config(
 	cfg: hickory_resolver::config::ResolverConfig,
 	mut opts: hickory_resolver::config::ResolverOpts,

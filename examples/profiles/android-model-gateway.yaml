@@ -1,0 +1,48 @@
+# Cargo features: gateway-llm,security-s1,tls-aws-lc
+config:
+  bindAddress: 127.0.0.1
+  workerThreads: 2
+  management:
+    mode: edge
+  securityAudit:
+    directory: ${AISP_EXAMPLE_STATE_DIR}/model-gateway/audit
+    maxSegmentBytes: 67108864
+    maxSegments: 8
+    retentionSeconds: 604800
+aiSystems:
+  - name: model-gateway
+    security:
+      mode: enforce
+      requiredIdentity:
+        user: true
+        tenant: true
+        agent: false
+      requiredAudit:
+        actionTypes:
+          - modelInvoke
+      policies:
+        - id: invoke-model
+          tenantId: tenant-a
+          actionType: modelInvoke
+          effect: allow
+          enabled: true
+          resourceId: local-model
+      dataEgress:
+        classification: internal
+        modelDestinations:
+          - 127.0.0.1:18000
+    llm:
+      port: 14100
+      policies:
+        jwtAuth:
+          mode: strict
+          issuer: ${AISP_EXAMPLE_ISSUER}
+          audiences:
+            - model-gateway
+          jwks:
+            file: ${AISP_EXAMPLE_JWKS_FILE}
+      models:
+        - name: local-model
+          provider: openAI
+          params:
+            baseUrl: http://127.0.0.1:18000/v1

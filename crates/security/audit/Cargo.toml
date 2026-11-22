@@ -10,3 +10,6 @@ security-types = { path = "../types" }
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+libc.workspace = true

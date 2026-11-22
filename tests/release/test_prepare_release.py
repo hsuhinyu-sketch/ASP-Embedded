@@ -1,5 +1,7 @@
 """Release identity, clean-source and archive checks; no production test interfaces."""
 
+from argparse import Namespace
+from copy import deepcopy
 import hashlib
 import importlib.util
 import json
@@ -71,6 +73,99 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 release.package(binary, root / "dist", self.info["version"], "llm",
                                 "a" * 40, self.info["build_target"], self.info, ["cargo", "build"])
+
+    def android_inputs(self, root):
+        binary = root / "gateway"
+        binary.write_bytes(b"Android executable fixture")
+        binary.chmod(0o755)
+        sha = release.digest(binary)
+        info = dict(self.info, build_target=release.ANDROID, rust_version="1.96.1")
+        command = release.build_command("llm", release.ANDROID, True)
+        receipt = root / "build.json"
+        receipt.write_text(json.dumps({"version": info["version"], "gitRevision": info["git_revision"],
+                                       "binarySha256": sha, "buildCommand": command,
+                                       "toolchain": {"rustc": "1.96.1", "ndkRevision": "30.0.16248370", "api": 29}}))
+        args = Namespace(version=info["version"], android_acceptance=root / "security.json",
+                         android_performance=root / "performance.json")
+        security = {"successful": True, "binarySha256": sha, "buildInfo": info,
+                    "configuredWorkerThreads": 2, "device": {"model": "test-tablet", "api": "29"}}
+        audit = {"persistenceHealthy": True, "persistenceFailures": 0, "capacity": {
+            "maximumBytes": release.ANDROID_AUDIT_BYTES, "retentionSeconds": release.ANDROID_RETENTION_SECONDS}}
+        load = {"successful": True, "errors": [], "completed": 600, "concurrency": 8,
+                "measuredStartNs": 1, "measuredEndNs": 600_000_000_001, "finishedNs": 600_000_000_002}
+        performance = {"successful": True, "binarySha256": sha, "version": info,
+                       "device": ["test-tablet", "29", "3.18.140 aarch64", "Permissive"],
+                       "parameters": {"workerThreads": 2}, "security": {"requiredAudit": True, "mode": "enforce"},
+                       "soaks": {protocol: {"effectiveWorkerThreads": 2, "audit": deepcopy(audit),
+                                            "load": dict(load, stream=protocol == "sse")}
+                                 for protocol in ("http", "sse")}}
+        args.android_acceptance.write_text(json.dumps(security))
+        args.android_performance.write_text(json.dumps(performance))
+        return binary, args, receipt
+
+    def test_android_elf_requires_api29_arm64_and_bionic_loader(self):
+        output = ("  Machine: AArch64\n"
+                  "[Requesting program interpreter: /system/bin/linker64]\n"
+                  "Android 0x00000084 NT_ANDROID_TYPE_IDENT\n   description data: 1d 00 00 00 72 33 30\n")
+        release.validate_android_elf(output)
+        for old, new in (("AArch64", "x86-64"), ("/system/bin/linker64", "/lib/ld-linux-aarch64.so.1"),
+                         ("1d 00 00 00", "1e 00 00 00"), ("NT_ANDROID_TYPE_IDENT", "NT_GNU_BUILD_ID")):
+            with self.subTest(old=old), self.assertRaisesRegex(ValueError, "Android API 29"):
+                release.validate_android_elf(output.replace(old, new))
+
+    def test_android_requires_matching_successful_device_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary, args, receipt = self.android_inputs(Path(directory))
+            revision = self.info["git_revision"]
+            original = json.loads(args.android_performance.read_text())
+            for change in (
+                lambda report: report.update(binarySha256="0" * 64),
+                lambda report: report.update(successful=False),
+                lambda report: report["version"].update(git_revision="a" * 40 + "-dirty"),
+                lambda report: report["soaks"]["sse"].update(effectiveWorkerThreads=8),
+                lambda report: report["soaks"]["http"]["load"].update(measuredEndNs=1_000_000_001),
+                lambda report: report["soaks"]["http"]["load"].update(finishedNs=1),
+                lambda report: report["soaks"]["http"]["audit"]["capacity"].update(maximumBytes=134217728),
+                lambda report: report["soaks"]["sse"]["audit"].update(persistenceHealthy=False),
+            ):
+                report = deepcopy(original)
+                change(report)
+                args.android_performance.write_text(json.dumps(report))
+                with self.assertRaises(ValueError):
+                    release.android_evidence(binary, args, revision, receipt)
+            args.android_performance.write_text(json.dumps(original))
+            security = json.loads(args.android_acceptance.read_text())
+            security["configuredWorkerThreads"] = 4
+            args.android_acceptance.write_text(json.dumps(security))
+            with self.assertRaisesRegex(ValueError, "two-worker"):
+                release.android_evidence(binary, args, revision, receipt)
+
+    def test_android_bundle_seals_reports_and_ships_the_rc_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary, args, receipt = self.android_inputs(root)
+            revision = self.info["git_revision"]
+            info, command, evidence = release.android_evidence(binary, args, revision, receipt)
+            with patch.object(release, "check_source", return_value=revision):
+                archive = release.package(binary, root / "dist", args.version, "llm", revision,
+                                          release.ANDROID, info, command, android=evidence)
+            with tarfile.open(archive) as stream:
+                names = {Path(entry.name).name: entry for entry in stream.getmembers() if entry.isfile()}
+                manifest = json.load(stream.extractfile(names["manifest.json"]))
+                self.assertEqual(manifest["android"]["binarySha256"], manifest["files"]["ai-security-platform"])
+                self.assertEqual(manifest["android"]["evidence"], {
+                    "securitySha256": release.digest(args.android_acceptance),
+                    "performanceSha256": release.digest(args.android_performance)})
+                config = stream.extractfile(names[release.ANDROID_CONFIG]).read()
+                self.assertEqual(config, (ROOT / "examples/profiles" / release.ANDROID_CONFIG).read_bytes())
+                self.assertNotIn("security.json", names)
+                self.assertNotIn("performance.json", names)
+            binary.write_bytes(b"changed after validation")
+            with self.assertRaisesRegex(ValueError, "staged Android binary"):
+                release.package(binary, root / "different-dist", args.version, "llm", revision,
+                                release.ANDROID, info, command, android=evidence)
+            with self.assertRaisesRegex(ValueError, "build receipt"):
+                release.android_evidence(binary, args, revision, receipt)
 
 
 if __name__ == "__main__":

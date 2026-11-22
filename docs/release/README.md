@@ -6,7 +6,7 @@
 
 ## 构建和核验
 
-使用项目锁定的 Rust 1.96 工具链、Cargo.lock 和原生 Linux GNU 环境。先完成源码审阅与必要回归，再在已提交的干净工作区执行；打包工具拒绝未跟踪文件或未提交改动，不会提交、推送、创建标签或发布 Release。
+使用项目锁定的 Rust 1.96 工具链和 Cargo.lock，在已提交的干净工作区执行。以下命令构建原生 Linux GNU 候选。
 
 ```sh
 python3 scripts/prepare_release.py --version vX.Y.Z-rc.N --profile llm --check
@@ -25,7 +25,7 @@ python3 scripts/prepare_release.py --version vX.Y.Z-rc.N --profile llm
 
 五种产物均使用 `ai-security-platform` 入口，场景名体现在压缩包和 manifest 中。Full 含 LLM/MCP/A2A/RAG 与模型路由；上述组合不启用普通请求日志数据库、OTLP 或云身份 SDK。需要这些集成时另选已有 features 并重新验证，不能把不同组合的结果混用。`security-s1` 提供统一执行底座；安全配置仍须明确 Enforce、可信身份及场景所需控制，默认 Audit 行为没有改变。
 
-输出位于 `target/release-dist/`：场景/版本/target 命名的 tar.gz 及 SHA-256 文件。包内仅含可执行文件、manifest、Cargo.lock、许可（含 `LICENSE-regex-cache`）和本说明，不带测试替身、密钥、缓存、基准原始数据或开发日志。manifest 记录 features、构建命令、源码提交、二进制构建标识及各载荷文件摘要；同名产物拒绝覆盖。
+输出为按场景、版本和 target 命名的 tar.gz 及 SHA-256 文件，默认位于 `target/release-dist/`。原生候选包包含可执行文件、manifest、Cargo.lock、许可（含 `LICENSE-regex-cache`）和本说明。manifest 记录 features、构建命令、源码提交、二进制构建标识及各载荷文件摘要。同名产物拒绝覆盖。
 
 ```sh
 cd target/release-dist
@@ -33,6 +33,35 @@ sha256sum -c ai-security-platform-*.sha256
 ```
 
 运行时所需配置和凭据由业务方提供。配置参考和第三方来源说明见源码仓库的 `docs/reference/configuration-guide.md`、`docs/third-party/README.md`。许可证条款以对应来源为准，Cargo.lock 保留依赖版本和来源；此候选产物不是独立依赖许可审计证明。
+
+## Android ARM64 LLM 候选
+
+首个 Android 候选为 `aarch64-linux-android` 的 `llm` CLI，链接基线 API 29。使用 x86-64 Linux GNU、仓库指定的 Rust 及 Android 目标标准库、含 API 29 链接器的 Android NDK。参考工具链为 Rust 1.96.1 和 NDK r30。构建先写入版本、源码提交、NDK 版本、API 与二进制摘要，供真机验收和最终打包共同核对。
+
+```sh
+rc_version=v0.1.0-rc.1
+android_target=aarch64-linux-android
+binary="${CARGO_TARGET_DIR:-target}/$android_target/release/ai-security-platform"
+evidence="target/release-evidence/$android_target/$rc_version"
+
+python3 scripts/prepare_release.py --version "$rc_version" --profile llm \
+  --target "$android_target" --android-ndk "$ANDROID_NDK_HOME" --build-only
+
+python3 tests/protocol/run_android_audit.py --binary "$binary" --worker-threads 2 \
+  --report "$evidence/security.json"
+python3 tests/performance/run_android_baseline.py --binary "$binary" \
+  --acceptance "$evidence/security.json" --out "$evidence/performance" \
+  --worker-threads 2 --concurrency 8 --rounds 1 --seconds 5 \
+  --soak 600 --soak-protocols http sse --collect-stages
+
+python3 scripts/prepare_release.py --version "$rc_version" --profile llm \
+  --target "$android_target" --android-acceptance "$evidence/security.json" \
+  --android-performance "$evidence/performance/report.json"
+```
+
+将 `rc_version` 换为维护者选定的版本。构建前可用 `--check` 核对输入，将它与构建命令的 `--build-only` 互换。真机阶段需要已授权的 Android 10 ARM64 设备和 ADB，可向两个验收脚本传入 `--serial` 或 `--adb`。最终打包读取先前构建的二进制，核对两个报告的构建标识、SHA-256、设备范围、有效 worker 数和持续负载结果。manifest 保留报告摘要、设备和工具链信息，原始验收数据保存在本地证据目录。[真机验收方法](../protocol/README.md#android-arm64-llm-安全验收)
+
+Android 包附带候选配置，使用回环监听、2 个 worker、512 MiB 审计段容量和 7 天保留，要求 Enforce、可信 JWT 与持久审计。并发 8 是本次候选的验收档位。部署时将 `AISP_EXAMPLE_ISSUER`、`AISP_EXAMPLE_JWKS_FILE` 和 `AISP_EXAMPLE_STATE_DIR` 分别设为 JWT 签发者、JWKS 文件和绝对状态目录，按实际审计写入速率评估存储容量。[Android 候选配置](../../examples/profiles/android-model-gateway.yaml) · [场景配置说明](../README.md#安全网关场景-profile)
 
 ## GitHub 候选产物
 

@@ -465,7 +465,8 @@ llm_config = Path("crates/gateway/runtime/src/types/local/llm.rs").read_text()
 assert '#[cfg(feature = "gateway-llm")]\n#[path = "local/llm.rs"]\nmod llm_config;' in local_config
 assert "pub struct LocalLLMConfig" not in local_config and "pub struct LocalLLMConfig" in llm_config
 assert "async fn convert_llm_config" not in local_config and "async fn convert_llm_config" in llm_config
-assert "llm_router:" not in Path("crates/gateway/runtime/src/types/agent.rs").read_text()
+routes = Path("crates/gateway/runtime/src/types/routing.rs").read_text()
+assert "pub struct Route {" in routes and "llm_router:" not in routes
 assert "backend.resource_name()" in local_config
 assert "!backend.is_llm()" in proxy_source, "MCP bound model calls must retain the final backend-kind check"
 for required in ("scope.reserve(*kind, action)?", "Box::pin(guard.dispatch(&backend_call.target)).await?", "upstream.call(call)"):

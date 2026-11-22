@@ -303,11 +303,11 @@ class Gateway:
                 self.signer.close()
             raise
 
-    def token(self, user="alice", tenant="tenant-a"):
+    def token(self, user="alice", tenant="tenant-a", *, ttl_seconds=600):
         header = b64(json.dumps({"alg": "EdDSA", "kid": "local"}).encode())
         claims = b64(json.dumps({"sub": user, "tenant_id": tenant, "client_id": "client-a",
                                  "iss": "https://issuer.example", "aud": "mcp",
-                                 "exp": int(time.time()) + 600}).encode())
+                                 "exp": int(time.time()) + ttl_seconds}).encode())
         message = f"{header}.{claims}".encode()
         signature = self.signer.sign(message)
         return f"{header}.{claims}.{b64(signature)}"

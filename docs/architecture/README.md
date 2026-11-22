@@ -28,6 +28,10 @@ Rust 类型及其序列化声明是配置和 Admin Schema 的来源。修改字�
 
 更新配置类型后应重新生成 Schema，并运行 Rust CI 的生成一致性检查。Schema 校验不能替代 Host 的配置准备、能力检查或安全授权。
 
+## Runtime 类型归属
+
+`types::local` 定义 YAML 输入和归一化入口。旧版日志与追踪字段的迁移由 `types/local/migration.rs` 维护，CLI 迁移和配置加载共用同一转换。路由、匹配规则和索引在 `types/routing.rs`，监听 TLS 的版本、输入和预备配置在 `types/listener_tls.rs`，IP 地址族在 `types/discovery.rs`。现有 `types::agent`、`types::frontend` 和 `types::local` 的公开路径通过重导出提供这些定义。
+
 ## 扩展方式
 
 新增协议在对应协议组件实现处理规则，通过 Host 装配和 Cargo 能力声明接入。跨协议执行使用受控契约，例如 MCP Sampling 通过模型执行契约调用模型，不绑定 LLM Runtime 内部实现。

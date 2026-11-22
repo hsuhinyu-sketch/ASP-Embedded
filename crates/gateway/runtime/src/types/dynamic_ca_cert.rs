@@ -15,8 +15,8 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 
+use super::listener_tls::{TLSVersion, tls_versions_for_range};
 use crate::transport::tls;
-use crate::types::agent::{ServerTLSConfig, TLSVersion};
 
 struct DynamicCa {
 	cert_der: Vec<u8>,
@@ -159,7 +159,7 @@ pub(super) fn build_dynamic_ca_server_config(
 ) -> anyhow::Result<rustls::ServerConfig> {
 	let provider = tls::provider_with_options(cipher_suites, key_exchange_groups);
 
-	let versions = super::agent::tls_versions_for_range(min_version, max_version)?;
+	let versions = tls_versions_for_range(min_version, max_version)?;
 	let mut config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
 		.with_protocol_versions(&versions)
 		.expect("server config must be valid")
@@ -176,27 +176,4 @@ pub(super) fn build_dynamic_ca_server_config(
 		.unwrap_or_else(|| default_alpns.to_vec());
 
 	Ok(config)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_dynamic_ca_tls_config_with_profile(
-	ca_cert_pem: Vec<u8>,
-	ca_key_pem: Vec<u8>,
-	default_alpns: Vec<Vec<u8>>,
-	min_version: Option<TLSVersion>,
-	max_version: Option<TLSVersion>,
-	cipher_suites: Option<Vec<tls::CipherSuite>>,
-	key_exchange_groups: Option<Vec<tls::KeyExchangeGroup>>,
-	cache_config: crate::DynamicCaCertCacheConfig,
-) -> anyhow::Result<ServerTLSConfig> {
-	ServerTLSConfig::dynamic_ca_with_profile(
-		ca_cert_pem,
-		ca_key_pem,
-		default_alpns,
-		min_version,
-		max_version,
-		cipher_suites,
-		key_exchange_groups,
-		cache_config,
-	)
 }
